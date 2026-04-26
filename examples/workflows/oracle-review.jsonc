@@ -1,0 +1,11 @@
+{
+  "name": "oracle-review",
+  "description": "High-context decision-consistency review of the current plan or conversation",
+  "modelPolicy": "agent",
+  "context": "fork",
+  "forkFallback": "error",
+  "clarify": false,
+  "agentScope": "both",
+  "agent": "oracle",
+  "task": "Review the inherited conversation and current request for decision drift, contradictions, hidden assumptions, risks, and the best next move.\n\nFocus/request:\n{{args}}\n\nReturn your structured Oracle result normally. Use intercom only if you are blocked on a real decision."
+}

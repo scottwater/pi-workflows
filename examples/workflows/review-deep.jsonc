@@ -1,0 +1,43 @@
+{
+  "name": "review-deep",
+  "description": "Deep multi-agent code review with comments and type-design analysis",
+  "modelPolicy": "agent",
+  "context": "fresh",
+  "clarify": false,
+  "agentScope": "both",
+  "chain": [
+    {
+      "parallel": [
+        {
+          "agent": "skeptical-engineer",
+          "task": "Review the requested scope skeptically.\n\nScope/request:\n{{args}}\n\nFocus on hidden assumptions, design risks, correctness issues, maintainability, and likely regressions. Return high-confidence findings only."
+        },
+        {
+          "agent": "code-reviewer",
+          "task": "Review the requested scope for guideline compliance, correctness, regressions, and high-confidence implementation issues.\n\nScope/request:\n{{args}}"
+        },
+        {
+          "agent": "pr-test-analyzer",
+          "task": "Review the requested scope for missing tests, weak assertions, brittle test design, and coverage gaps.\n\nScope/request:\n{{args}}"
+        },
+        {
+          "agent": "silent-failure-hunter",
+          "task": "Review the requested scope for swallowed errors, weak fallbacks, silent failures, weak observability, and poor error reporting.\n\nScope/request:\n{{args}}"
+        },
+        {
+          "agent": "comment-analyzer",
+          "task": "Review comments, docstrings, inline docs, and README/API documentation touched by the requested scope. Check accuracy, usefulness, staleness risk, and whether comments explain the wrong things.\n\nScope/request:\n{{args}}"
+        },
+        {
+          "agent": "type-design-analyzer",
+          "task": "Review changed or introduced types for invariant enforcement, illegal states, encapsulation, naming, and whether type design clarifies or hides domain rules.\n\nScope/request:\n{{args}}"
+        }
+      ],
+      "failFast": false
+    },
+    {
+      "agent": "review-synthesizer",
+      "task": "Synthesize these parallel review outputs into one final review.\n\nOriginal scope/request:\n{{args}}\n\nReviewer outputs:\n{{previous}}\n\nDeduplicate overlapping findings, drop low-confidence noise, preserve file paths and concrete reasoning, and prioritize by severity/actionability."
+    }
+  ]
+}
