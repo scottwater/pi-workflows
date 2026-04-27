@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
 type ContextMode = "fresh" | "fork";
@@ -195,6 +195,34 @@ type RenderMessageLike = {
   content?: unknown;
   details?: unknown;
 };
+
+type SessionSnapshotContext = {
+  sessionManager?: {
+    getSessionFile?: () => string | undefined;
+    _rewriteFile?: () => void;
+    flushed?: boolean;
+  };
+};
+
+type WorkflowOutboundMessage = Parameters<ExtensionAPI["sendMessage"]>[0];
+
+function persistWorkflowSessionSnapshot(ctx: SessionSnapshotContext | undefined): void {
+  try {
+    const sessionManager = ctx?.sessionManager;
+    const sessionFile = sessionManager?.getSessionFile?.();
+    if (!sessionFile || typeof sessionManager?._rewriteFile !== "function") return;
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    sessionManager._rewriteFile();
+    sessionManager.flushed = true;
+  } catch (error) {
+    console.error("Failed to persist workflow session snapshot:", error);
+  }
+}
+
+function sendWorkflowMessage(pi: ExtensionAPI, ctx: SessionSnapshotContext | undefined, message: WorkflowOutboundMessage): void {
+  pi.sendMessage(message);
+  persistWorkflowSessionSnapshot(ctx);
+}
 
 function deleteWorkflowLiveState(requestId: string): void {
   const timer = workflowLiveStateTimers.get(requestId);
@@ -1168,7 +1196,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
       updatedAt: Date.now(),
       progress: [],
     });
-    pi.sendMessage({
+    sendWorkflowMessage(pi, ctx, {
       customType: WORKFLOW_PROGRESS_MESSAGE_TYPE,
       content: `▶ Running workflow /${workflow.name}...`,
       display: true,
@@ -1208,7 +1236,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
         updatedAt: Date.now(),
         progress: [],
       });
-      pi.sendMessage({
+      sendWorkflowMessage(pi, ctx, {
         customType: WORKFLOW_PROGRESS_MESSAGE_TYPE,
         content: `↻ Workflow /${workflow.name}: forked context unavailable; retrying with fresh context...`,
         display: true,
@@ -1231,7 +1259,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
           progress: finalProgress,
         });
       }
-      pi.sendMessage({
+      sendWorkflowMessage(pi, ctx, {
         customType: WORKFLOW_RESULT_MESSAGE_TYPE,
         content: text,
         display: true,
@@ -1261,7 +1289,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
     try {
       const existingState = workflowLiveStates.get(requestId);
       if (existingState) setWorkflowLiveState({ ...existingState, status: "failed", updatedAt: Date.now() });
-      pi.sendMessage({
+      sendWorkflowMessage(pi, ctx, {
         customType: WORKFLOW_RESULT_MESSAGE_TYPE,
         content: `Workflow /${workflow.name} failed: ${message}`,
         display: true,
@@ -1314,7 +1342,7 @@ function registerWorkflowCommand(pi: ExtensionAPI, workflow: Workflow): void {
       const workflow = workflows.find((candidate) => candidate.name === workflowName);
       if (!workflow) {
         ctx.ui.notify(`Workflow not found: ${workflowName}. Try /workflow --list or /reload.`, "error");
-        pi.sendMessage({
+        sendWorkflowMessage(pi, ctx, {
           customType: "pi-workflows-list",
           content: `Workflow not found: ${workflowName}\n\n${listWorkflowText(workflows, warnings)}`,
           display: true,
@@ -1368,7 +1396,7 @@ export default function registerPiWorkflows(pi: ExtensionAPI): void {
       registerUserWorkflowCommands(activeCwd);
       const { workflows, warnings } = discoverWorkflows(activeCwd);
       if (!trimmed || trimmed === "--list" || trimmed === "list") {
-        pi.sendMessage({
+        sendWorkflowMessage(pi, ctx, {
           customType: "pi-workflows-list",
           content: listWorkflowText(workflows, warnings),
           display: true,
@@ -1382,7 +1410,7 @@ export default function registerPiWorkflows(pi: ExtensionAPI): void {
       const workflow = workflows.find((candidate) => candidate.name === name);
       if (!workflow) {
         ctx.ui.notify(`Workflow not found: ${name}`, "error");
-        pi.sendMessage({
+        sendWorkflowMessage(pi, ctx, {
           customType: "pi-workflows-list",
           content: `Workflow not found: ${name}\n\n${listWorkflowText(workflows, warnings)}`,
           display: true,

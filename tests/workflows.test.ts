@@ -184,6 +184,52 @@ test("model overrides are rejected by agent policy and forwarded by workflow pol
   assert.equal((chainedParams.chain?.[1] as any).parallel[0].model, "google/gemini-3-pro");
 });
 
+test("workflow custom messages force a session snapshot even before an assistant message exists", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const rewrites: number[] = [];
+  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-session-snapshot-"));
+  const sessionFile = join(sessionDir, "session.jsonl");
+  const sessionManager = {
+    flushed: false,
+    getSessionFile() {
+      return sessionFile;
+    },
+    _rewriteFile() {
+      rewrites.push(messages.length);
+    },
+  };
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: false,
+        result: { content: [{ type: "text", text: "final review" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  await runWorkflow(
+    pi as any,
+    { ...createCtx(), sessionManager } as any,
+    { name: "snapshot-test", sourcePath: "snapshot-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+    "",
+  );
+
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
+  assert.deepEqual(rewrites, [1, 2]);
+  assert.equal(sessionManager.flushed, true);
+});
+
 test("runtime flag extraction preserves quoted positional arguments", async () => {
   const events = createEvents();
   const requests: any[] = [];
