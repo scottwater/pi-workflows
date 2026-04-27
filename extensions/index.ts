@@ -979,22 +979,33 @@ function formatDuration(ms: number | undefined): string {
   return minutes > 0 ? `${minutes}m${seconds.toString().padStart(2, "0")}s` : `${seconds}s`;
 }
 
-function formatProgressLines(workflowName: string, update: SlashSubagentUpdate): string[] {
+function formatLiveWidgetProgressLines(workflowName: string, update: SlashSubagentUpdate): string[] {
   const progress = update.progress ?? [];
-  const lines = [`▶ workflow /${workflowName} · Ctrl+O details`];
+  const count = update.toolCount ?? progress.reduce((sum, entry) => sum + (entry.toolCount ?? 0), 0);
+  const tool = update.currentTool ? ` · ${update.currentTool}` : "";
+  const lines = [`▶ workflow /${workflowName} · running${count ? ` · ${count} tools` : ""}${tool}`];
   if (progress.length === 0) {
-    const count = update.toolCount ?? 0;
-    lines.push(`running${count ? ` · ${count} tools` : ""}${update.currentTool ? ` · ${update.currentTool}` : ""}`);
+    lines.push("  starting subagents...");
     return lines;
   }
 
-  for (const entry of progress.slice(0, 3)) {
+  for (const entry of progress.slice(0, 6)) {
     const stats = formatProgressStats(entry);
-    const tool = entry.currentTool ? ` · ${entry.currentTool}` : "";
-    lines.push(`${progressStatusIcon(entry.status)} ${entry.agent ?? "agent"}: ${entry.status ?? "running"}${stats ? ` (${stats})` : ""}${tool}`);
+    const activeTool = entry.currentTool ? ` · ${entry.currentTool}${entry.currentToolArgs ? ` ${entry.currentToolArgs}` : ""}` : "";
+    lines.push(`  ${progressStatusIcon(entry.status)} ${entry.agent ?? "agent"}: ${entry.status ?? "running"}${stats ? ` (${stats})` : ""}${activeTool}`);
+
+    for (const recentTool of (entry.recentTools ?? []).slice(-2)) {
+      lines.push(`      tool: ${recentTool.tool ?? "tool"}${recentTool.args ? ` ${recentTool.args}` : ""}`);
+    }
+
+    for (const output of (entry.recentOutput ?? []).slice(-3).filter((line) => line.trim())) {
+      lines.push(`      ${output.trim()}`);
+    }
+
+    if (entry.error) lines.push(`      error: ${entry.error}`);
   }
 
-  if (progress.length > 3) lines.push(`… ${progress.length - 3} more agents`);
+  if (progress.length > 6) lines.push(`  … ${progress.length - 6} more agents`);
   return lines;
 }
 
@@ -1124,8 +1135,8 @@ export async function requestSubagentRun(
         toolCount: existing?.toolCount,
       });
       if (ctx.hasUI) {
-        ctx.ui.setStatus("pi-workflows", "running workflow... · Ctrl+O details");
-        ctx.ui.setWidget("pi-workflows", [`▶ workflow /${workflowName} · Ctrl+O details`, "starting subagents..."]);
+        ctx.ui.setStatus("pi-workflows", "running workflow... · live details above editor");
+        ctx.ui.setWidget("pi-workflows", formatLiveWidgetProgressLines(workflowName, { requestId, progress: [] }));
       }
     };
 
@@ -1162,8 +1173,8 @@ export async function requestSubagentRun(
         toolCount: count,
       });
       if (ctx.hasUI) {
-        ctx.ui.setStatus("pi-workflows", `${label}${count} tools${tool ? ` · ${tool}` : ""} · Ctrl+O details`);
-        ctx.ui.setWidget("pi-workflows", formatProgressLines(workflowName, update));
+        ctx.ui.setStatus("pi-workflows", `${label}${count} tools${tool ? ` · ${tool}` : ""} · live details above editor`);
+        ctx.ui.setWidget("pi-workflows", formatLiveWidgetProgressLines(workflowName, update));
       }
     };
 

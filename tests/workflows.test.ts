@@ -709,6 +709,65 @@ test("project workflow overrides same-named global direct command during executi
   assert.equal(requests[0].params.task, "project arg");
 }));
 
+test("workflow live widget shows pending details without requiring expansion", async () => {
+  const events = createEvents();
+  const widgets: any[] = [];
+  const pi = {
+    events,
+    sendMessage() {},
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget(_key: string, lines: any) {
+        widgets.push(lines);
+      },
+    },
+  };
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit("subagent:slash:update", {
+        requestId: request.requestId,
+        toolCount: 2,
+        progress: [{
+          agent: "code-reviewer",
+          status: "running",
+          currentTool: "read",
+          currentToolArgs: "src/index.ts",
+          toolCount: 2,
+          tokens: 1200,
+          durationMs: 1500,
+          recentOutput: ["found issue in parser"],
+          recentTools: [{ tool: "read", args: "src/index.ts" }],
+        }],
+      });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: false,
+        result: { content: [{ type: "text", text: "ok" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  await runWorkflow(
+    pi as any,
+    ctx as any,
+    { name: "widget-test", sourcePath: "widget-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+    "",
+  );
+
+  const detailedWidget = widgets.find((lines) => Array.isArray(lines) && lines.some((line: string) => line.includes("found issue in parser")));
+  assert.ok(detailedWidget);
+  assert.match(detailedWidget.join("\n"), /tool: read src\/index\.ts/);
+  assert.doesNotMatch(detailedWidget.join("\n"), /Ctrl\+O details/);
+});
+
 test("workflow message renderers expose live progress and expanded agent details", async () => {
   const events = createEvents();
   const messages: any[] = [];
