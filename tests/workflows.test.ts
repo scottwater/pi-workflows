@@ -16,6 +16,12 @@ const STARTED_EVENT = "subagent:slash:started";
 const RESPONSE_EVENT = "subagent:slash:response";
 const CANCEL_EVENT = "subagent:slash:cancel";
 
+const testTheme = {
+  fg: (_name: string, text: string) => text,
+  bg: (_name: string, text: string) => text,
+  bold: (text: string) => text,
+};
+
 type Listener = (data: unknown) => void;
 
 function withTempHome<T>(fn: (home: string) => T): T {
@@ -591,7 +597,7 @@ test("fork fallback retries once with fresh context", async () => {
   const progressMessages = messages.filter((message) => message.customType === "pi-workflows-progress");
   assert.equal(progressMessages.length, 2);
   const firstProgressLines = progressRenderer(progressMessages[0], { expanded: false }).render(120).join("\n");
-  assert.match(firstProgressLines, /workflow \/fork-test · failed/);
+  assert.match(firstProgressLines, /workflow \/fork-test \| failed/);
   assert.doesNotMatch(firstProgressLines, /Running workflow/);
   const firstExpandedProgressLines = progressRenderer(progressMessages[0], { expanded: true }).render(120).join("\n");
   assert.match(firstExpandedProgressLines, /params: single · a · fork/);
@@ -762,9 +768,13 @@ test("workflow live widget shows pending details without requiring expansion", a
     "",
   );
 
-  const detailedWidget = widgets.find((lines) => Array.isArray(lines) && lines.some((line: string) => line.includes("found issue in parser")));
+  const renderedWidgets = widgets.map((widget) => {
+    if (typeof widget === "function") return widget(null, testTheme).render(120);
+    return widget;
+  });
+  const detailedWidget = renderedWidgets.find((lines) => Array.isArray(lines) && lines.some((line: string) => line.includes("found issue in parser")));
   assert.ok(detailedWidget);
-  assert.match(detailedWidget.join("\n"), /tool: read src\/index\.ts/);
+  assert.match(detailedWidget.join("\n"), /read: src\/index\.ts/);
   assert.doesNotMatch(detailedWidget.join("\n"), /Ctrl\+O details/);
 });
 
@@ -773,6 +783,17 @@ test("workflow message renderers expose live progress and expanded agent details
   const messages: any[] = [];
   const renderers = new Map<string, any>();
   const progressComponents: any[] = [];
+  const longBashCommand = `node scripts/check-rendering.js ${"--flag ".repeat(30)}--important-tail-token`;
+  const synthesizedReview = [
+    "## Summary",
+    "synthesized final review",
+    ...Array.from({ length: 34 }, (_, index) => `- synthesized line ${index + 1}`),
+  ].join("\n");
+  const reviewerNotes = [
+    "### Reviewer Markdown",
+    "- reviewer bullet 1",
+    ...Array.from({ length: 12 }, (_, index) => `- unique reviewer line ${index + 1}`),
+  ].join("\n");
   const pi = {
     events,
     sendMessage(message: any) {
@@ -814,7 +835,7 @@ test("workflow message renderers expose live progress and expanded agent details
         requestId: request.requestId,
         isError: false,
         result: {
-          content: [{ type: "text", text: "synthesized final review" }],
+          content: [{ type: "text", text: synthesizedReview }],
           details: {
             progress: [{
               agent: "code-reviewer",
@@ -825,12 +846,12 @@ test("workflow message renderers expose live progress and expanded agent details
               tokens: 1800,
               durationMs: 2500,
               recentOutput: ["terminal progress completed"],
-              recentTools: [{ tool: "read", args: "src/index.ts" }],
+              recentTools: [{ tool: "read", args: "src/index.ts" }, { tool: "bash", args: longBashCommand }],
             }],
             results: [{
               agent: "code-reviewer",
               exitCode: 0,
-              finalOutput: "detailed reviewer notes",
+              finalOutput: reviewerNotes,
               sessionFile: "/tmp/child-session.jsonl",
               savedOutputPath: "/tmp/saved-review.md",
               artifactPaths: {
@@ -839,6 +860,10 @@ test("workflow message renderers expose live progress and expanded agent details
                 jsonlPath: "/tmp/reviewer-events.jsonl",
                 metadataPath: "/tmp/reviewer-metadata.json",
               },
+            }, {
+              agent: "review-synthesizer",
+              exitCode: 0,
+              finalOutput: synthesizedReview,
             }],
           },
         },
@@ -862,8 +887,9 @@ test("workflow message renderers expose live progress and expanded agent details
   const progressLines = progressRenderer(progressMessage, { expanded: true }).render(120).join("\n");
   assert.match(progressLines, /workflow \/render-test/);
   assert.match(progressLines, /✓ code-reviewer: completed/);
-  assert.match(progressLines, /read src\/index\.ts/);
+  assert.match(progressLines, /read: src\/index\.ts/);
   assert.match(progressLines, /terminal progress completed/);
+  assert.match(progressLines, /important-tail-token/);
   assert.doesNotMatch(progressLines, /code-reviewer: running/);
   assert.equal(progressComponents.length, 1);
   const liveComponentLines = progressComponents[0].render(120).join("\n");
@@ -872,10 +898,21 @@ test("workflow message renderers expose live progress and expanded agent details
 
   const resultMessage = messages.find((message) => message.customType === "pi-workflows-result");
   const collapsedLines = resultRenderer(resultMessage, { expanded: false }).render(120).join("\n");
-  assert.match(collapsedLines, /Ctrl\+O details/);
+  assert.match(collapsedLines, /synthesized final review/);
+  assert.match(collapsedLines, /synthesized line 34/);
+  assert.match(collapsedLines, /Ctrl\+O for 2 agent details/);
+  assert.doesNotMatch(collapsedLines, /Agent details/);
+  assert.doesNotMatch(collapsedLines, /Reviewer Markdown/);
+  const narrowCollapsedLines = resultRenderer(resultMessage, { expanded: false }).render(48).join("\n");
+  assert.match(narrowCollapsedLines, /synthesized line 34/);
+  assert.doesNotMatch(narrowCollapsedLines, /more visual lines/);
+  const rerenderedCollapsedLines = resultRenderer(resultMessage, { expanded: false }).render(120).join("\n");
+  assert.match(rerenderedCollapsedLines, /synthesized line 34/);
   const expandedLines = resultRenderer(resultMessage, { expanded: true }).render(120).join("\n");
   assert.match(expandedLines, /Agent details/);
-  assert.match(expandedLines, /detailed reviewer notes/);
+  assert.match(expandedLines, /synthesized line 34/);
+  assert.match(expandedLines, /Reviewer Markdown/);
+  assert.match(expandedLines, /unique reviewer line 12/);
   assert.match(expandedLines, /session: \/tmp\/child-session\.jsonl/);
   assert.match(expandedLines, /saved output: \/tmp\/saved-review\.md/);
   assert.match(expandedLines, /artifact input: \/tmp\/reviewer-input\.json/);

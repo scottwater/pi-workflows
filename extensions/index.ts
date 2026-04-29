@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, MessageRenderOptions, Theme } from "@mariozechner/pi-coding-agent";
+import { Box, Container, Markdown, Spacer, Text, type Component, type MarkdownTheme } from "@mariozechner/pi-tui";
 
 type ContextMode = "fresh" | "fork";
 type AgentScope = "user" | "project" | "both";
@@ -795,21 +796,57 @@ function nonEmptyLines(text: string): string[] {
   return text.split("\n").map((line) => line.trimEnd()).filter((line) => line.trim());
 }
 
-function truncateDisplayLine(line: string, width: number): string {
-  if (width <= 0) return "";
-  if (line.length <= width) return line;
-  if (width <= 1) return "…".slice(0, width);
-  return `${line.slice(0, width - 1)}…`;
+const plainTheme = {
+  fg: (_name: string, text: string) => text,
+  bg: (_name: string, text: string) => text,
+  bold: (text: string) => text,
+} as Theme;
+
+function themeOrFallback(theme: Theme | undefined): Theme {
+  return theme ?? plainTheme;
 }
 
-function renderLinesComponent(linesFactory: (width: number) => string[]) {
+function fallbackMarkdownTheme(theme: Theme): MarkdownTheme {
   return {
-    invalidate() {},
-    render(width: number): string[] {
-      const safeWidth = Math.max(1, width || 80);
-      return linesFactory(safeWidth).map((line) => truncateDisplayLine(line, safeWidth));
-    },
+    heading: (text) => theme.fg("mdHeading" as never, text),
+    link: (text) => theme.fg("mdLink" as never, text),
+    linkUrl: (text) => theme.fg("mdLinkUrl" as never, text),
+    code: (text) => theme.fg("mdCode" as never, text),
+    codeBlock: (text) => theme.fg("mdCodeBlock" as never, text),
+    codeBlockBorder: (text) => theme.fg("mdCodeBlockBorder" as never, text),
+    quote: (text) => theme.fg("mdQuote" as never, text),
+    quoteBorder: (text) => theme.fg("mdQuoteBorder" as never, text),
+    hr: (text) => theme.fg("mdHr" as never, text),
+    listBullet: (text) => theme.fg("mdListBullet" as never, text),
+    bold: (text) => theme.bold(text),
+    italic: (text) => "italic" in theme && typeof theme.italic === "function" ? theme.italic(text) : text,
+    underline: (text) => "underline" in theme && typeof theme.underline === "function" ? theme.underline(text) : text,
+    strikethrough: (text) => "strikethrough" in theme && typeof theme.strikethrough === "function" ? theme.strikethrough(text) : text,
   };
+}
+
+function markdownThemeFor(theme: Theme): MarkdownTheme {
+  return fallbackMarkdownTheme(theme);
+}
+
+function addText(target: Box | Container, text: string, theme: Theme, color?: string): void {
+  target.addChild(new Text(color ? theme.fg(color as never, text) : text, 0, 0));
+}
+
+function addMarkdown(target: Box | Container, text: string, theme: Theme): void {
+  target.addChild(new Markdown(text, 0, 0, markdownThemeFor(theme)));
+}
+
+function addSpacer(target: Box | Container): void {
+  target.addChild(new Spacer(1));
+}
+
+function createMessageBox(theme: Theme, bg: "toolPendingBg" | "toolSuccessBg" | "toolErrorBg"): { container: Container; box: Box } {
+  const container = new Container();
+  container.addChild(new Spacer(1));
+  const box = new Box(1, 1, (text: string) => theme.bg(bg as never, text));
+  container.addChild(box);
+  return { container, box };
 }
 
 function progressStatusIcon(status: string | undefined): string {
@@ -817,6 +854,13 @@ function progressStatusIcon(status: string | undefined): string {
   if (status === "failed") return "✗";
   if (status === "pending") return "◦";
   return "…";
+}
+
+function progressStatusColor(status: string | undefined): string {
+  if (status === "completed" || status === "complete") return "success";
+  if (status === "failed") return "error";
+  if (status === "pending") return "dim";
+  return "warning";
 }
 
 function formatProgressStats(entry: ProgressEntry): string {
@@ -845,53 +889,120 @@ function summarizeParams(params: SubagentParamsLike | undefined): string {
   return params.context ?? "";
 }
 
-function formatProgressDetailLines(progress: ProgressEntry[], expanded: boolean): string[] {
-  if (progress.length === 0) return ["  no agent progress yet"];
-  const limit = expanded ? progress.length : Math.min(progress.length, 4);
-  const lines: string[] = [];
-  for (const entry of progress.slice(0, limit)) {
-    const stats = formatProgressStats(entry);
-    const tool = entry.currentTool ? ` · ${entry.currentTool}${entry.currentToolArgs ? ` ${entry.currentToolArgs}` : ""}` : "";
-    lines.push(`  ${progressStatusIcon(entry.status)} ${entry.agent ?? "agent"}: ${entry.status ?? "running"}${stats ? ` (${stats})` : ""}${tool}`);
-    const recentTools = expanded ? (entry.recentTools ?? []).slice(-5) : [];
-    for (const recentTool of recentTools) {
-      lines.push(`      tool: ${recentTool.tool ?? "tool"}${recentTool.args ? ` ${recentTool.args}` : ""}`);
-    }
-    const recent = expanded ? entry.recentOutput ?? [] : entry.recentOutput?.slice(-1) ?? [];
-    for (const output of recent.filter((line) => line.trim())) {
-      lines.push(`      ${output.trim()}`);
-    }
-    if (entry.error) lines.push(`      error: ${entry.error}`);
-  }
-  if (!expanded && progress.length > limit) lines.push(`  … ${progress.length - limit} more agents — Ctrl+O for details`);
-  return lines;
+function maybeClip(value: string, max: number, expanded: boolean): string {
+  return !expanded && value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
-function renderWorkflowProgressMessage(message: RenderMessageLike, options: RenderOptionsLike = {}) {
+function formatWorkflowToolCall(tool: string | undefined, args: string | undefined, expanded = false): string | undefined {
+  if (!tool) return undefined;
+  const safeArgs = args ?? "";
+  switch (tool) {
+    case "bash": {
+      const cmd = safeArgs.replace(/[\n\t]/g, " ").trim();
+      return `$ ${maybeClip(cmd, 100, expanded)}`;
+    }
+    case "read": return `[read: ${safeArgs}]`;
+    case "write": return `[write: ${safeArgs}]`;
+    case "edit": return `[edit: ${safeArgs}]`;
+    case "grep": return `[grep: ${safeArgs}]`;
+    case "find": return `[find: ${safeArgs}]`;
+    case "ls": return `[ls: ${safeArgs || "."}]`;
+    default: return `[${tool}${safeArgs ? `: ${maybeClip(safeArgs, 80, expanded)}` : ""}]`;
+  }
+}
+
+function addProgressEntries(box: Box, progress: ProgressEntry[], expanded: boolean, theme: Theme): void {
+  if (progress.length === 0) {
+    addText(box, "no agent progress yet", theme, "dim");
+    return;
+  }
+
+  const limit = expanded ? progress.length : Math.min(progress.length, 4);
+  for (let index = 0; index < Math.min(progress.length, limit); index++) {
+    const entry = progress[index]!;
+    const stats = formatProgressStats(entry);
+    const status = entry.status ?? "running";
+    const icon = theme.fg(progressStatusColor(status) as never, progressStatusIcon(status));
+    addText(
+      box,
+      `${icon} ${theme.fg("toolTitle" as never, theme.bold(entry.agent ?? "agent"))}: ${status}${stats ? ` (${stats})` : ""}`,
+      theme,
+    );
+
+    const active = formatWorkflowToolCall(entry.currentTool, entry.currentToolArgs, expanded);
+    if (active) addText(box, `    > ${active}`, theme, "warning");
+
+    const recentTools = expanded ? (entry.recentTools ?? []).slice(-5) : (entry.recentTools ?? []).slice(-2);
+    for (const recentTool of recentTools) {
+      const rendered = formatWorkflowToolCall(recentTool.tool, recentTool.args, expanded);
+      if (rendered) addText(box, `    ${rendered}`, theme, "dim");
+    }
+
+    const recent = expanded ? entry.recentOutput ?? [] : entry.recentOutput?.slice(-3) ?? [];
+    for (const output of recent.filter((line) => line.trim())) {
+      addText(box, `    ${output.trim()}`, theme, "dim");
+    }
+    if (entry.error) addText(box, `    error: ${entry.error}`, theme, "error");
+    if (index < limit - 1 && index < progress.length - 1) addSpacer(box);
+  }
+
+  if (!expanded && progress.length > limit) {
+    addSpacer(box);
+    addText(box, `... ${progress.length - limit} more agent${progress.length - limit === 1 ? "" : "s"} — Ctrl+O for remaining agents`, theme, "warning");
+  }
+}
+
+function renderWorkflowProgressMessage(message: RenderMessageLike, options: MessageRenderOptions | RenderOptionsLike = { expanded: false }, rawTheme?: Theme) {
+  const theme = themeOrFallback(rawTheme);
   const details = (message.details && typeof message.details === "object" ? message.details : {}) as WorkflowMessageDetails;
   const requestId = details.requestId;
   const expanded = options.expanded === true;
   const content = messageText(message.content);
-  return renderLinesComponent(() => {
+  const container = new Container();
+  let lastKey = "";
+
+  const rebuild = () => {
     const state = requestId ? workflowLiveStates.get(requestId) : undefined;
     const workflow = details.workflow ?? state?.workflow ?? "workflow";
     const status = state?.status ?? details.status ?? "running";
     const progress = state?.progress ?? details.progress ?? [];
-    if (!expanded && progress.length === 0 && !state) return [content || `▶ workflow /${workflow} starting…`];
-    const toolCount = state?.toolCount ?? details.toolCount;
-    const tools = toolCount !== undefined ? ` · ${toolCount} tools` : "";
-    const header = `▶ workflow /${workflow} · ${status}${tools}${expanded ? "" : " · Ctrl+O details"}`;
-    if (!expanded) return [header, ...formatProgressDetailLines(progress, false)];
-    return [
-      header,
-      details.sourcePath ? `source: ${details.sourcePath}` : "",
-      requestId ? `request: ${requestId}` : "",
-      details.params ? `params: ${summarizeParams(details.params)}` : "",
-      "",
-      "Agents",
-      ...formatProgressDetailLines(progress, true),
-    ].filter((line) => line !== "");
-  });
+    const key = JSON.stringify({ status, progress, toolCount: state?.toolCount ?? details.toolCount, currentTool: state?.currentTool ?? details.currentTool, expanded });
+    if (key === lastKey) return;
+    lastKey = key;
+
+    container.clear();
+    container.addChild(new Spacer(1));
+    const bg = status === "failed" ? "toolErrorBg" : status === "completed" ? "toolSuccessBg" : "toolPendingBg";
+    const box = new Box(1, 1, (text: string) => theme.bg(bg as never, text));
+    container.addChild(box);
+    const toolCount = state?.toolCount ?? details.toolCount ?? progress.reduce((sum, entry) => sum + (entry.toolCount ?? 0), 0);
+    const currentTool = state?.currentTool ?? details.currentTool;
+    const iconColor = status === "completed" ? "success" : status === "failed" ? "error" : "warning";
+    const icon = status === "completed" ? "ok" : status === "failed" ? "fail" : "...";
+    const stats = [status, toolCount ? `${toolCount} tools` : undefined, currentTool].filter(Boolean).join(" · ");
+    addText(box, `${theme.fg(iconColor as never, icon)} ${theme.fg("toolTitle" as never, theme.bold(`workflow /${workflow}`))} | ${stats}`, theme);
+    addSpacer(box);
+
+    if (progress.length === 0 && !state) {
+      addText(box, content || "starting subagents...", theme, "dim");
+      return;
+    }
+
+    if (expanded) {
+      if (details.sourcePath) addText(box, `source: ${details.sourcePath}`, theme, "dim");
+      if (requestId) addText(box, `request: ${requestId}`, theme, "dim");
+      if (details.params) addText(box, `params: ${summarizeParams(details.params)}`, theme, "dim");
+      addSpacer(box);
+    }
+    addProgressEntries(box, progress, expanded, theme);
+  };
+
+  container.render = (width: number): string[] => {
+    rebuild();
+    return Container.prototype.render.call(container, width);
+  };
+
+  return container;
 }
 
 function resultEntryText(entry: AgentResultEntry): string | undefined {
@@ -902,28 +1013,27 @@ function resultEntryFailed(entry: AgentResultEntry): boolean {
   return Boolean(entry.error || (entry.exitCode !== undefined && entry.exitCode !== 0));
 }
 
-function formatResultEntryLines(entry: AgentResultEntry, index: number, expanded: boolean): string[] {
+function addResultEntry(box: Box, entry: AgentResultEntry, index: number, theme: Theme): void {
   const failed = resultEntryFailed(entry);
-  const status = failed ? "failed" : "done";
-  const lines = [`  ${failed ? "✗" : "✓"} ${entry.agent ?? `agent-${index + 1}`} · ${status}${entry.model ? ` · ${entry.model}` : ""}`];
-  if (expanded && entry.task) lines.push(`      task: ${entry.task}`);
-  if (entry.sessionFile) lines.push(`      session: ${entry.sessionFile}`);
-  if (entry.savedOutputPath) lines.push(`      saved output: ${entry.savedOutputPath}`);
-  if (entry.artifactPaths?.inputPath) lines.push(`      artifact input: ${entry.artifactPaths.inputPath}`);
-  if (entry.artifactPaths?.outputPath) lines.push(`      artifact output: ${entry.artifactPaths.outputPath}`);
-  if (entry.artifactPaths?.jsonlPath) lines.push(`      artifact jsonl: ${entry.artifactPaths.jsonlPath}`);
-  if (entry.artifactPaths?.metadataPath) lines.push(`      artifact metadata: ${entry.artifactPaths.metadataPath}`);
+  const status = failed ? "failed" : "completed";
+  const icon = failed ? theme.fg("error" as never, "✗") : theme.fg("success" as never, "✓");
+  addText(box, `${icon} ${theme.fg("toolTitle" as never, theme.bold(entry.agent ?? `agent-${index + 1}`))} · ${status}${entry.model ? ` · ${entry.model}` : ""}`, theme);
+  if (entry.task) addText(box, `task: ${entry.task}`, theme, "dim");
+  if (entry.sessionFile) addText(box, `session: ${entry.sessionFile}`, theme, "dim");
+  if (entry.savedOutputPath) addText(box, `saved output: ${entry.savedOutputPath}`, theme, "dim");
+  if (entry.artifactPaths?.inputPath) addText(box, `artifact input: ${entry.artifactPaths.inputPath}`, theme, "dim");
+  if (entry.artifactPaths?.outputPath) addText(box, `artifact output: ${entry.artifactPaths.outputPath}`, theme, "dim");
+  if (entry.artifactPaths?.jsonlPath) addText(box, `artifact jsonl: ${entry.artifactPaths.jsonlPath}`, theme, "dim");
+  if (entry.artifactPaths?.metadataPath) addText(box, `artifact metadata: ${entry.artifactPaths.metadataPath}`, theme, "dim");
+
   const text = resultEntryText(entry);
-  if (text) {
-    const outputLines = nonEmptyLines(text);
-    const visible = expanded ? outputLines : outputLines.slice(0, 2);
-    for (const line of visible) lines.push(`      ${line}`);
-    if (!expanded && outputLines.length > visible.length) lines.push(`      … ${outputLines.length - visible.length} more lines — Ctrl+O details`);
-  }
-  return lines;
+  if (!text) return;
+  addSpacer(box);
+  addMarkdown(box, text, theme);
 }
 
-function renderWorkflowResultMessage(message: RenderMessageLike, options: RenderOptionsLike = {}) {
+function renderWorkflowResultMessage(message: RenderMessageLike, options: MessageRenderOptions | RenderOptionsLike = { expanded: false }, rawTheme?: Theme) {
+  const theme = themeOrFallback(rawTheme);
   const details = (message.details && typeof message.details === "object" ? message.details : {}) as WorkflowMessageDetails;
   const workflow = details.workflow ?? "workflow";
   const expanded = options.expanded === true;
@@ -933,42 +1043,66 @@ function renderWorkflowResultMessage(message: RenderMessageLike, options: Render
   const result = details.result;
   const resultEntries = result?.details?.results ?? [];
   const progress = progressEntriesForRequest(details.requestId, details);
-  return renderLinesComponent(() => {
-    const header = `${isError ? "✗" : "✓"} workflow /${workflow} ${isError ? "failed" : "completed"}${expanded ? "" : " · Ctrl+O details"}`;
-    if (!expanded) {
-      const visible = contentLines.slice(0, 6);
-      return [
-        header,
-        ...(details.retriedFromFork ? ["  note: forked context unavailable; retried fresh"] : []),
-        ...visible.map((line) => `  ${line}`),
-        ...(contentLines.length > visible.length || resultEntries.length > 0 ? [`  … Ctrl+O for ${resultEntries.length || "more"} agent details`] : []),
-      ];
-    }
+  const container = new Container();
+  container.addChild(new Spacer(1));
 
-    const lines: string[] = [header];
-    if (details.sourcePath) lines.push(`source: ${details.sourcePath}`);
-    if (details.requestId) lines.push(`request: ${details.requestId}`);
-    if (details.params) lines.push(`params: ${summarizeParams(details.params)}`);
-    if (details.retriedFromFork) lines.push("note: forked context unavailable; retried with fresh context");
-    if (result?.details?.asyncId) lines.push(`async: ${result.details.asyncId}`);
-    if (result?.details?.asyncDir) lines.push(`async dir: ${result.details.asyncDir}`);
-    if (result?.details?.artifacts?.dir) lines.push(`artifacts: ${result.details.artifacts.dir}`);
-    lines.push("");
-    lines.push(isError ? "Error/output" : "Output");
-    if (contentLines.length === 0) lines.push("  (no text output)");
-    else for (const line of contentLines) lines.push(`  ${line}`);
-    if (resultEntries.length > 0) {
-      lines.push("");
-      lines.push("Agent details");
-      resultEntries.forEach((entry, index) => lines.push(...formatResultEntryLines(entry, index, true)));
-    }
-    if (progress.length > 0) {
-      lines.push("");
-      lines.push("Progress summary");
-      lines.push(...formatProgressDetailLines(progress, true));
-    }
-    return lines;
-  });
+  const icon = isError ? theme.fg("error" as never, "✗") : theme.fg("success" as never, "✓");
+  const agentCount = resultEntries.length > 0 ? `${resultEntries.length} agent${resultEntries.length === 1 ? "" : "s"}` : undefined;
+  const detailHint = resultEntries.length > 0 ? ` · Ctrl+O for ${resultEntries.length} agent detail${resultEntries.length === 1 ? "" : "s"}` : "";
+  addText(
+    container,
+    `${icon} ${theme.fg("toolTitle" as never, theme.bold(`workflow /${workflow}`))} ${isError ? "failed" : "completed"}${agentCount ? ` · ${agentCount}` : ""}${expanded ? "" : detailHint}`,
+    theme,
+  );
+  addSpacer(container);
+
+  if (details.retriedFromFork) {
+    addText(container, "note: forked context unavailable; retried fresh", theme, "warning");
+    addSpacer(container);
+  }
+
+  if (expanded) {
+    const metaLines = [
+      details.sourcePath ? `source: ${details.sourcePath}` : undefined,
+      details.requestId ? `request: ${details.requestId}` : undefined,
+      details.params ? `params: ${summarizeParams(details.params)}` : undefined,
+      result?.details?.asyncId ? `async: ${result.details.asyncId}` : undefined,
+      result?.details?.asyncDir ? `async dir: ${result.details.asyncDir}` : undefined,
+      result?.details?.artifacts?.dir ? `artifacts: ${result.details.artifacts.dir}` : undefined,
+    ].filter((line): line is string => Boolean(line));
+    for (const line of metaLines) addText(container, line, theme, "dim");
+    if (metaLines.length > 0) addSpacer(container);
+  }
+
+  if (contentLines.length === 0) {
+    addText(container, "(no text output)", theme, "dim");
+  } else {
+    addMarkdown(container, content, theme);
+  }
+
+  if (expanded && resultEntries.length > 0) {
+    addSpacer(container);
+    const detailBoxBg = isError ? "toolErrorBg" : "toolSuccessBg";
+    const detailBox = new Box(1, 1, (text: string) => theme.bg(detailBoxBg as never, text));
+    container.addChild(detailBox);
+    addText(detailBox, "Agent details", theme, "toolTitle");
+    addSpacer(detailBox);
+    resultEntries.forEach((entry, index) => {
+      addResultEntry(detailBox, entry, index, theme);
+      if (index < resultEntries.length - 1) addSpacer(detailBox);
+    });
+  }
+
+  if (expanded && progress.length > 0) {
+    addSpacer(container);
+    const progressBoxBg = isError ? "toolErrorBg" : "toolSuccessBg";
+    const progressBox = new Box(1, 1, (text: string) => theme.bg(progressBoxBg as never, text));
+    container.addChild(progressBox);
+    addText(progressBox, "Progress summary", theme, "toolTitle");
+    addProgressEntries(progressBox, progress, true, theme);
+  }
+
+  return container;
 }
 
 function formatDuration(ms: number | undefined): string {
@@ -979,34 +1113,184 @@ function formatDuration(ms: number | undefined): string {
   return minutes > 0 ? `${minutes}m${seconds.toString().padStart(2, "0")}s` : `${seconds}s`;
 }
 
-function formatLiveWidgetProgressLines(workflowName: string, update: SlashSubagentUpdate): string[] {
+function formatWorkflowProgressFallbackLines(workflowName: string, update: SlashSubagentUpdate & { status?: string }): string[] {
   const progress = update.progress ?? [];
+  const status = update.status ?? "running";
   const count = update.toolCount ?? progress.reduce((sum, entry) => sum + (entry.toolCount ?? 0), 0);
   const tool = update.currentTool ? ` · ${update.currentTool}` : "";
-  const lines = [`▶ workflow /${workflowName} · running${count ? ` · ${count} tools` : ""}${tool}`];
-  if (progress.length === 0) {
-    lines.push("  starting subagents...");
-    return lines;
-  }
+  const lines = [`▶ workflow /${workflowName} · ${status}${count ? ` · ${count} tools` : ""}${tool}`];
+  if (progress.length === 0) return [...lines, "  starting subagents..."];
 
-  for (const entry of progress.slice(0, 6)) {
+  for (const entry of progress.slice(0, 4)) {
     const stats = formatProgressStats(entry);
-    const activeTool = entry.currentTool ? ` · ${entry.currentTool}${entry.currentToolArgs ? ` ${entry.currentToolArgs}` : ""}` : "";
-    lines.push(`  ${progressStatusIcon(entry.status)} ${entry.agent ?? "agent"}: ${entry.status ?? "running"}${stats ? ` (${stats})` : ""}${activeTool}`);
-
+    lines.push(`  ${progressStatusIcon(entry.status)} ${entry.agent ?? "agent"}: ${entry.status ?? "running"}${stats ? ` (${stats})` : ""}`);
+    const active = formatWorkflowToolCall(entry.currentTool, entry.currentToolArgs);
+    if (active) lines.push(`      > ${active}`);
     for (const recentTool of (entry.recentTools ?? []).slice(-2)) {
-      lines.push(`      tool: ${recentTool.tool ?? "tool"}${recentTool.args ? ` ${recentTool.args}` : ""}`);
+      const rendered = formatWorkflowToolCall(recentTool.tool, recentTool.args);
+      if (rendered) lines.push(`      ${rendered}`);
     }
-
     for (const output of (entry.recentOutput ?? []).slice(-3).filter((line) => line.trim())) {
       lines.push(`      ${output.trim()}`);
     }
-
     if (entry.error) lines.push(`      error: ${entry.error}`);
   }
-
-  if (progress.length > 6) lines.push(`  … ${progress.length - 6} more agents`);
+  if (progress.length > 4) lines.push(`  ... ${progress.length - 4} more agents — Ctrl+O for remaining agents`);
   return lines;
+}
+
+type RenderFailureContext = { kind: "progress" | "result" | "widget"; workflow?: string; requestId?: string };
+
+const loggedRenderFailures = new Set<string>();
+
+function logWorkflowRenderFailure(context: RenderFailureContext, error: unknown): void {
+  const key = `${context.kind}:${context.workflow ?? "workflow"}:${context.requestId ?? "unknown"}`;
+  if (loggedRenderFailures.has(key)) return;
+  loggedRenderFailures.add(key);
+  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  console.warn(`pi-workflows: ${context.kind} renderer fallback for ${context.workflow ?? "workflow"}${context.requestId ? ` (${context.requestId})` : ""}: ${message}`);
+}
+
+function linesComponent(linesFactory: () => string[]): Component {
+  return {
+    invalidate() {},
+    render() {
+      return linesFactory();
+    },
+  };
+}
+
+function safeComponent(component: Component, fallbackLines: () => string[], context: RenderFailureContext): Component {
+  return {
+    invalidate() {
+      try {
+        component.invalidate?.();
+      } catch (error) {
+        logWorkflowRenderFailure(context, error);
+      }
+    },
+    render(width: number) {
+      try {
+        return component.render(width);
+      } catch (error) {
+        logWorkflowRenderFailure(context, error);
+        return fallbackLines();
+      }
+    },
+  };
+}
+
+function safeBuildComponent(build: () => Component, fallbackLines: () => string[], context: RenderFailureContext): Component {
+  try {
+    return safeComponent(build(), fallbackLines, context);
+  } catch (error) {
+    logWorkflowRenderFailure(context, error);
+    return linesComponent(fallbackLines);
+  }
+}
+
+function resultFallbackLines(message: RenderMessageLike, options: MessageRenderOptions | RenderOptionsLike = { expanded: false }): string[] {
+  const details = (message.details && typeof message.details === "object" ? message.details : {}) as WorkflowMessageDetails;
+  const workflow = details.workflow ?? "workflow";
+  const expanded = options.expanded === true;
+  const isError = details.isError === true;
+  const result = details.result;
+  const resultEntries = result?.details?.results ?? [];
+  const content = messageText(message.content) || details.errorText || details.error || "(no text output)";
+  const lines = [`${isError ? "✗" : "✓"} workflow /${workflow} ${isError ? "failed" : "completed"}`];
+  lines.push("", ...content.split("\n"));
+  if (expanded && resultEntries.length > 0) {
+    lines.push("", "Agent details");
+    for (const [index, entry] of resultEntries.entries()) {
+      lines.push(`${resultEntryFailed(entry) ? "✗" : "✓"} ${entry.agent ?? `agent-${index + 1}`}`);
+      if (entry.sessionFile) lines.push(`  session: ${entry.sessionFile}`);
+      if (entry.savedOutputPath) lines.push(`  saved output: ${entry.savedOutputPath}`);
+      const text = resultEntryText(entry);
+      if (text) lines.push(...text.split("\n").map((line) => `  ${line}`));
+    }
+  } else if (!expanded && resultEntries.length > 0) {
+    lines[0] += ` · Ctrl+O for ${resultEntries.length} agent detail${resultEntries.length === 1 ? "" : "s"}`;
+  }
+  return lines;
+}
+
+function progressFallbackLines(message: RenderMessageLike): string[] {
+  const details = (message.details && typeof message.details === "object" ? message.details : {}) as WorkflowMessageDetails;
+  const requestId = details.requestId;
+  const state = requestId ? workflowLiveStates.get(requestId) : undefined;
+  const workflow = details.workflow ?? state?.workflow ?? "workflow";
+  const progress = state?.progress ?? details.progress ?? [];
+  return formatWorkflowProgressFallbackLines(workflow, {
+    requestId: requestId ?? "",
+    progress,
+    status: state?.status ?? details.status ?? "running",
+    toolCount: state?.toolCount ?? details.toolCount,
+    currentTool: state?.currentTool ?? details.currentTool,
+  });
+}
+
+function createWorkflowProgressWidget(requestId: string, workflowName: string, theme: Theme): Container {
+  const container = new Container();
+  let lastKey = "";
+
+  const rebuild = () => {
+    const state = workflowLiveStates.get(requestId);
+    const progress = state?.progress ?? [];
+    const status = state?.status ?? "starting";
+    const key = JSON.stringify({ status, progress, toolCount: state?.toolCount, currentTool: state?.currentTool });
+    if (key === lastKey) return;
+    lastKey = key;
+
+    container.clear();
+    container.addChild(new Spacer(1));
+    const bg = status === "failed" ? "toolErrorBg" : status === "completed" ? "toolSuccessBg" : "toolPendingBg";
+    const box = new Box(1, 1, (text: string) => theme.bg(bg as never, text));
+    container.addChild(box);
+    const count = state?.toolCount ?? progress.reduce((sum, entry) => sum + (entry.toolCount ?? 0), 0);
+    const iconColor = status === "completed" ? "success" : status === "failed" ? "error" : "warning";
+    const icon = status === "completed" ? "ok" : status === "failed" ? "fail" : "...";
+    const stats = [status, count ? `${count} tools` : undefined, state?.currentTool].filter(Boolean).join(" · ");
+    addText(box, `${theme.fg(iconColor as never, icon)} ${theme.fg("toolTitle" as never, theme.bold(`workflow /${workflowName}`))} | ${stats}`, theme);
+    addSpacer(box);
+
+    if (progress.length === 0) {
+      addText(box, "starting subagents...", theme, "dim");
+      return;
+    }
+    addProgressEntries(box, progress, false, theme);
+  };
+
+  container.render = (width: number): string[] => {
+    rebuild();
+    return Container.prototype.render.call(container, width);
+  };
+
+  return container;
+}
+
+function setWorkflowProgressWidget(
+  ctx: ExtensionCommandContext,
+  workflowName: string,
+  requestId: string,
+  update: SlashSubagentUpdate & { status?: string },
+): void {
+  const fallback = () => {
+    const state = workflowLiveStates.get(requestId);
+    if (!state) return formatWorkflowProgressFallbackLines(workflowName, update);
+    return formatWorkflowProgressFallbackLines(workflowName, {
+      requestId,
+      status: state.status,
+      progress: state.progress,
+      currentTool: state.currentTool,
+      toolCount: state.toolCount,
+    });
+  };
+
+  ctx.ui.setWidget("pi-workflows", (_tui, theme) => safeBuildComponent(
+    () => createWorkflowProgressWidget(requestId, workflowName, theme),
+    fallback,
+    { kind: "widget", workflow: workflowName, requestId },
+  ));
 }
 
 function resultHasFailure(result: AgentToolResult): boolean {
@@ -1136,7 +1420,7 @@ export async function requestSubagentRun(
       });
       if (ctx.hasUI) {
         ctx.ui.setStatus("pi-workflows", "running workflow... · live details above editor");
-        ctx.ui.setWidget("pi-workflows", formatLiveWidgetProgressLines(workflowName, { requestId, progress: [] }));
+        setWorkflowProgressWidget(ctx, workflowName, requestId, { requestId, status: "running", progress: [] });
       }
     };
 
@@ -1174,7 +1458,7 @@ export async function requestSubagentRun(
       });
       if (ctx.hasUI) {
         ctx.ui.setStatus("pi-workflows", `${label}${count} tools${tool ? ` · ${tool}` : ""} · live details above editor`);
-        ctx.ui.setWidget("pi-workflows", formatLiveWidgetProgressLines(workflowName, update));
+        setWorkflowProgressWidget(ctx, workflowName, requestId, update);
       }
     };
 
@@ -1384,10 +1668,24 @@ export default function registerPiWorkflows(pi: ExtensionAPI): void {
   };
 
   const rendererApi = pi as ExtensionAPI & {
-    registerMessageRenderer?: (customType: string, renderer: (message: RenderMessageLike, options: RenderOptionsLike) => unknown) => void;
+    registerMessageRenderer?: (customType: string, renderer: (message: RenderMessageLike, options: MessageRenderOptions, theme: Theme) => unknown) => void;
   };
-  rendererApi.registerMessageRenderer?.(WORKFLOW_PROGRESS_MESSAGE_TYPE, (message, options) => renderWorkflowProgressMessage(message, options));
-  rendererApi.registerMessageRenderer?.(WORKFLOW_RESULT_MESSAGE_TYPE, (message, options) => renderWorkflowResultMessage(message, options));
+  rendererApi.registerMessageRenderer?.(WORKFLOW_PROGRESS_MESSAGE_TYPE, (message, options, theme) => {
+    const details = (message.details && typeof message.details === "object" ? message.details : {}) as WorkflowMessageDetails;
+    return safeBuildComponent(
+      () => renderWorkflowProgressMessage(message, options, theme),
+      () => progressFallbackLines(message),
+      { kind: "progress", workflow: details.workflow, requestId: details.requestId },
+    );
+  });
+  rendererApi.registerMessageRenderer?.(WORKFLOW_RESULT_MESSAGE_TYPE, (message, options, theme) => {
+    const details = (message.details && typeof message.details === "object" ? message.details : {}) as WorkflowMessageDetails;
+    return safeBuildComponent(
+      () => renderWorkflowResultMessage(message, options, theme),
+      () => resultFallbackLines(message, options),
+      { kind: "result", workflow: details.workflow, requestId: details.requestId },
+    );
+  });
 
   registerUserWorkflowCommands(activeCwd);
 

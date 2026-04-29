@@ -18,7 +18,12 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@mariozechner/pi-coding-agent": ">=0.70.6",
+    "@mariozechner/pi-tui": ">=0.70.6"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.70.6",
+    "@mariozechner/pi-tui": "^0.70.6"
+  }
 }
