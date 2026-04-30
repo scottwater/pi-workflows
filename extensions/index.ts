@@ -180,6 +180,7 @@ type WorkflowMessageDetails = {
   params?: SubagentParamsLike;
   retry?: string;
   retriedFromFork?: boolean;
+  recoveredCompletionGuard?: boolean;
   status?: WorkflowLiveState["status"];
   progress?: ProgressEntry[];
   toolCount?: number;
@@ -776,11 +777,53 @@ function extractErrorText(response: SlashSubagentResponse): string {
   return directText(response.result) ?? "(workflow failed with no error output)";
 }
 
-function formatResponseText(response: SlashSubagentResponse, retriedFromFork: boolean): string {
+const COMPLETION_GUARD_PATTERN = /completed without making edits for an implementation task/i;
+
+function completionGuardText(entry: AgentResultEntry): string {
+  return `${entry.error ?? ""}\n${entry.finalOutput ?? ""}`;
+}
+
+function isCompletionGuardFailure(entry: AgentResultEntry): boolean {
+  return resultEntryFailed(entry) && COMPLETION_GUARD_PATTERN.test(completionGuardText(entry));
+}
+
+function failedResultEntries(result: AgentToolResult): AgentResultEntry[] {
+  return (result.details?.results ?? []).filter(resultEntryFailed);
+}
+
+function recoverableCompletionGuardOutput(response: SlashSubagentResponse): string | undefined {
+  const failedEntries = failedResultEntries(response.result);
+  if (failedEntries.length === 0) return undefined;
+  if (!failedEntries.every((entry) => isCompletionGuardFailure(entry) && Boolean(entry.finalOutput?.trim()))) return undefined;
+  return failedEntries
+    .map((entry) => entry.finalOutput?.trim())
+    .filter((text): text is string => Boolean(text))
+    .join("\n\n");
+}
+
+function workflowLooksReviewOnly(workflow: Workflow): boolean {
+  return /review/i.test(`${workflow.name}\n${workflow.description ?? ""}\n${workflow.sourcePath ?? ""}`);
+}
+
+function shouldRecoverCompletionGuardFailure(workflow: Workflow, response: SlashSubagentResponse): boolean {
+  return response.isError && workflowLooksReviewOnly(workflow) && Boolean(recoverableCompletionGuardOutput(response));
+}
+
+function formatResponseText(response: SlashSubagentResponse, retriedFromFork: boolean, recoveredCompletionGuard = false): string {
   const note = retriedFromFork
     ? "[pi-workflows note: forked context was unavailable, so this run retried with fresh subagent context.]\n\n"
     : "";
-  return `${note}${response.isError ? extractErrorText(response) : extractSuccessText(response.result)}`;
+  if (!response.isError) return `${note}${extractSuccessText(response.result)}`;
+
+  const recoveredOutput = recoverableCompletionGuardOutput(response);
+  if (recoveredOutput) {
+    const recoveryNote = recoveredCompletionGuard
+      ? "[pi-workflows note: pi-subagents reported a no-edits completion-guard failure, but this review workflow produced final output. Showing that output and treating the workflow as completed.]"
+      : "[pi-workflows note: pi-subagents reported a no-edits completion-guard failure after producing output. Showing the produced output below.]";
+    return `${note}${recoveryNote}\n\n${recoveredOutput}`;
+  }
+
+  return `${note}${extractErrorText(response)}`;
 }
 
 function messageText(content: unknown): string {
@@ -1540,7 +1583,9 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
       response = await requestSubagentRun(pi, ctx, requestId, params, workflow.name);
     }
 
-    const text = formatResponseText(response, retriedFromFork);
+    const recoveredCompletionGuard = shouldRecoverCompletionGuardFailure(workflow, response);
+    const effectiveIsError = response.isError && !recoveredCompletionGuard;
+    const text = formatResponseText(response, retriedFromFork, recoveredCompletionGuard);
     const errorText = response.isError ? extractErrorText(response) : undefined;
     try {
       const existingState = workflowLiveStates.get(requestId);
@@ -1549,7 +1594,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
       if (existingState) {
         setWorkflowLiveState({
           ...existingState,
-          status: response.isError ? "failed" : "completed",
+          status: effectiveIsError ? "failed" : "completed",
           updatedAt: Date.now(),
           progress: finalProgress,
         });
@@ -1564,20 +1609,27 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
           requestId,
           params: snapshotParams(params),
           retriedFromFork,
-          isError: response.isError,
+          isError: effectiveIsError,
           errorText,
+          error: recoveredCompletionGuard ? errorText : undefined,
+          recoveredCompletionGuard,
           result: finalResult,
         },
       });
     } catch (error) {
-      if (!response.isError) throw error;
+      if (!effectiveIsError) throw error;
       // Preserve the original subagent failure; result-rendering failures are secondary.
     }
-    if (response.isError) {
+    if (effectiveIsError) {
       responseFailure = new Error(`Workflow /${workflow.name} failed: ${errorText}`);
       if (ctx.hasUI) ctx.ui.notify(errorText ?? "Workflow failed", "error");
     } else if (ctx.hasUI) {
-      ctx.ui.notify(`Workflow /${workflow.name} completed`, "success");
+      ctx.ui.notify(
+        recoveredCompletionGuard
+          ? `Workflow /${workflow.name} completed with recovered review output`
+          : `Workflow /${workflow.name} completed`,
+        recoveredCompletionGuard ? "warning" : "success",
+      );
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

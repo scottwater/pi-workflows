@@ -37,7 +37,7 @@
     },
     {
       "agent": "review-synthesizer",
-      "task": "Synthesize these parallel review outputs into one final review.\n\nOriginal scope/request:\n{{args}}\n\nReviewer outputs:\n{{previous}}\n\nDeduplicate overlapping findings, drop low-confidence noise, preserve file paths and concrete reasoning, and prioritize by severity/actionability."
+      "task": "Synthesize these parallel review outputs into one final review. Do not edit files; this is review-only.\n\nOriginal scope/request:\n{{args}}\n\nReviewer outputs:\n{{previous}}\n\nDeduplicate overlapping findings, drop low-confidence noise, preserve file paths and concrete reasoning, and prioritize by severity/actionability."
     }
   ]
 }

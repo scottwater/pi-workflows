@@ -236,6 +236,56 @@ test("workflow custom messages force a session snapshot even before an assistant
   assert.equal(sessionManager.flushed, true);
 });
 
+test("review workflows recover synthesized output from no-edit completion guard failures", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+
+  const synthesizedReview = "## Summary\n\nFinal synthesized review output.";
+  const guardError = "Subagent completed without making edits for an implementation task.\nIt appears to have returned planning or scratchpad output instead of applying changes.";
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: true,
+        result: {
+          content: [{ type: "text", text: `❌ Chain failed: ${guardError}` }],
+          details: {
+            results: [{
+              agent: "review-synthesizer",
+              exitCode: 1,
+              error: guardError,
+              finalOutput: synthesizedReview,
+            }],
+          },
+        },
+      });
+    }, 0);
+  });
+
+  await runWorkflow(
+    pi as any,
+    createCtx() as any,
+    { name: "review-agents", description: "Multi-agent code review", sourcePath: "review-agents.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+    "",
+  );
+
+  const result = messages.find((message) => message.customType === "pi-workflows-result");
+  assert.ok(result);
+  assert.equal(result.details.isError, false);
+  assert.equal(result.details.recoveredCompletionGuard, true);
+  assert.match(result.content, /completion-guard failure/);
+  assert.match(result.content, /Final synthesized review output/);
+});
+
 test("runtime flag extraction preserves quoted positional arguments", async () => {
   const events = createEvents();
   const requests: any[] = [];
