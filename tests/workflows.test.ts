@@ -561,7 +561,7 @@ test("workflow result renderer marks error-only agent results as failed", async 
   assert.doesNotMatch(expandedLines, /✓ reviewer · done/);
 });
 
-test("malformed subagent responses reject with workflow context and reporting failures do not mask the original", async () => {
+test("malformed subagent responses aggregate reporting failures without masking the original", async () => {
   const events = createEvents();
   const pi = {
     events,
@@ -578,15 +578,26 @@ test("malformed subagent responses reject with workflow context and reporting fa
     }, 0);
   });
 
-  await assert.rejects(
-    runWorkflow(
-      pi as any,
-      createCtx() as any,
-      { name: "malformed-response-test", sourcePath: "malformed-response-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-      "",
-    ),
-    /Workflow \/malformed-response-test request .*malformed pi-subagents response: result must be an object/,
-  );
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  try {
+    await assert.rejects(
+      runWorkflow(
+        pi as any,
+        createCtx() as any,
+        { name: "malformed-response-test", sourcePath: "malformed-response-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+        "",
+      ),
+      (error: any) => {
+        assert.equal(error.name, "AggregateError");
+        assert.ok(error.errors.some((candidate: any) => /malformed pi-subagents response: result must be an object/.test(candidate.message)));
+        assert.ok(error.errors.some((candidate: any) => /send failed/.test(candidate.message)));
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
 });
 
 test("fork fallback retries once with fresh context", async () => {
@@ -776,6 +787,7 @@ test("workflow live widget shows pending details without requiring expansion", a
     ...createCtx(),
     hasUI: true,
     ui: {
+      supportsWorkflowWidgets: true,
       notify() {},
       setStatus() {},
       setWidget(_key: string, lines: any) {
@@ -826,6 +838,721 @@ test("workflow live widget shows pending details without requiring expansion", a
   assert.ok(detailedWidget);
   assert.match(detailedWidget.join("\n"), /read: src\/index\.ts/);
   assert.doesNotMatch(detailedWidget.join("\n"), /Ctrl\+O details/);
+});
+
+test("workflow with UI uses live widget instead of persistent progress card", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const widgets: any[] = [];
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify() {},
+      setStatus() {},
+      setWidget(_key: string, widget: any) {
+        widgets.push(widget);
+      },
+    },
+  };
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit("subagent:slash:update", {
+        requestId: request.requestId,
+        toolCount: 1,
+        progress: [{ agent: "reviewer", status: "running", currentTool: "read", currentToolArgs: "src/index.ts", toolCount: 1 }],
+      });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: false,
+        result: { content: [{ type: "text", text: "final review" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  await runWorkflow(
+    pi as any,
+    ctx as any,
+    { name: "ui-progress-test", sourcePath: "ui-progress-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+    "",
+  );
+
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.equal(messages[0].display, true);
+  assert.ok(widgets.slice(0, -1).some((widget) => typeof widget === "function"));
+  assert.equal(widgets.at(-1), undefined);
+});
+
+test("UI without workflow widget support keeps visible progress cards and status updates", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const widgets: any[] = [];
+  const statuses: any[] = [];
+  let rewriteCount = 0;
+  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-ui-no-widget-session-"));
+  const sessionFile = join(sessionDir, "session.jsonl");
+  const sessionManager = {
+    getSessionFile() {
+      return sessionFile;
+    },
+    _rewriteFile() {
+      rewriteCount += 1;
+    },
+  };
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    sessionManager,
+    ui: {
+      supportsWorkflowWidgets: false,
+      notify() {},
+      setStatus(_key: string, status: any) {
+        statuses.push(status);
+      },
+      setWidget(_key: string, widget: any) {
+        widgets.push(widget);
+      },
+    },
+  };
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: false,
+        result: { content: [{ type: "text", text: "visible ok" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  await runWorkflow(
+    pi as any,
+    ctx as any,
+    { name: "ui-no-widget-progress", sourcePath: "ui-no-widget-progress.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
+    "",
+  );
+
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
+  assert.deepEqual(messages.map((message) => message.display), [true, true]);
+  assert.equal(widgets.length, 0);
+  assert.ok(statuses.includes("running workflow..."));
+  assert.equal(statuses.at(-1), undefined);
+  assert.equal(rewriteCount, 2);
+  assert.match(messages[1].content, /visible ok/);
+});
+
+test("UI fork without workflow widget support still requires startup persistence", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const widgets: any[] = [];
+  const statuses: any[] = [];
+  let requestCount = 0;
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    ui: {
+      supportsWorkflowWidgets: false,
+      notify() {},
+      setStatus(_key: string, status: any) {
+        statuses.push(status);
+      },
+      setWidget(_key: string, widget: any) {
+        widgets.push(widget);
+      },
+    },
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  events.on(REQUEST_EVENT, () => {
+    requestCount += 1;
+  });
+
+  try {
+    await assert.rejects(
+      runWorkflow(
+        pi as any,
+        ctx as any,
+        { name: "ui-no-widget-fork-missing-persistence", sourcePath: "ui-no-widget-fork-missing-persistence.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
+        "",
+      ),
+      (error: any) => {
+        assert.equal(error.name, "WorkflowPersistenceError");
+        assert.equal(error.operation, "start");
+        assert.match(error.message, /session file path unavailable/);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(requestCount, 0);
+  assert.equal(widgets.length, 0);
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
+  assert.deepEqual(messages.map((message) => message.display), [true, true]);
+  assert.equal(messages[1].details.isError, true);
+  assert.equal(statuses.at(-1), undefined);
+});
+
+test("UI fork fallback creates hidden session-only leaf and uses live widget state", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const entries: any[] = [];
+  const widgets: any[] = [];
+  const rewrites: number[] = [];
+  const seenContexts: string[] = [];
+  const entryCountsAtRequest: number[] = [];
+  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-ui-fork-session-"));
+  const sessionFile = join(sessionDir, "session.jsonl");
+  const sessionManager = {
+    flushed: false,
+    getSessionFile() {
+      return sessionFile;
+    },
+    _rewriteFile() {
+      rewrites.push(messages.length);
+    },
+  };
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+    appendEntry(customType: string, data: any) {
+      entries.push({ customType, data });
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    sessionManager,
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify() {},
+      setStatus() {},
+      setWidget(_key: string, widget: any) {
+        widgets.push(widget);
+      },
+    },
+  };
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string; params: { context?: string } };
+    seenContexts.push(request.params.context ?? "");
+    entryCountsAtRequest.push(entries.length);
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      if (seenContexts.length === 1) {
+        events.emit(RESPONSE_EVENT, {
+          requestId: request.requestId,
+          isError: true,
+          errorText: "Failed to create forked subagent session",
+          result: { content: [{ type: "text", text: "fork failed" }] },
+        });
+      } else {
+        events.emit(RESPONSE_EVENT, {
+          requestId: request.requestId,
+          isError: false,
+          result: { content: [{ type: "text", text: "fresh ok" }], details: { results: [] } },
+        });
+      }
+    }, 0);
+  });
+
+  await runWorkflow(
+    pi as any,
+    ctx as any,
+    { name: "ui-fork-test", sourcePath: "ui-fork-test.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
+    "",
+  );
+
+  assert.deepEqual(seenContexts, ["fork", "fresh"]);
+  assert.deepEqual(entryCountsAtRequest, [1, 1]);
+  assert.deepEqual(entries.map((entry) => entry.customType), ["pi-workflows-progress"]);
+  assert.equal(entries[0].data.display, false);
+  assert.equal(entries[0].data.details.status, "starting");
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.equal(messages[0].display, true);
+  assert.equal(messages[0].details.retriedFromFork, true);
+  assert.match(messages[0].content, /fresh ok/);
+  assert.deepEqual(rewrites, [0, 0, 1]);
+  assert.equal(sessionManager.flushed, true);
+  assert.ok(widgets.slice(0, -1).some((widget) => typeof widget === "function"));
+  assert.equal(widgets.at(-1), undefined);
+});
+
+test("UI workflow failure sends final result and clears live widget", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const widgets: any[] = [];
+  const statuses: any[] = [];
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify() {},
+      setStatus(_key: string, status: any) {
+        statuses.push(status);
+      },
+      setWidget(_key: string, widget: any) {
+        widgets.push(widget);
+      },
+    },
+  };
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: true,
+        errorText: "subagent exploded",
+        result: { content: [{ type: "text", text: "boom" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  await assert.rejects(
+    runWorkflow(
+      pi as any,
+      ctx as any,
+      { name: "ui-failure-test", sourcePath: "ui-failure-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+      "",
+    ),
+    /subagent exploded/,
+  );
+
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.equal(messages[0].display, true);
+  assert.equal(messages[0].details.isError, true);
+  assert.match(messages[0].content, /subagent exploded|boom/);
+  assert.ok(widgets.slice(0, -1).some((widget) => typeof widget === "function"));
+  assert.equal(widgets.at(-1), undefined);
+  assert.equal(statuses.at(-1), undefined);
+});
+
+test("UI fork workflow surfaces session snapshot persistence failures", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const entries: any[] = [];
+  let requestCount = 0;
+  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-ui-persist-fail-"));
+  const sessionFile = join(sessionDir, "session.jsonl");
+  const sessionManager = {
+    getSessionFile() {
+      return sessionFile;
+    },
+    _rewriteFile() {
+      throw new Error("disk full");
+    },
+  };
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+    appendEntry(customType: string, data: any) {
+      entries.push({ customType, data });
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    sessionManager,
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+    },
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  events.on(REQUEST_EVENT, () => {
+    requestCount += 1;
+  });
+
+  try {
+    await assert.rejects(
+      runWorkflow(
+        pi as any,
+        ctx as any,
+        { name: "ui-persist-fail", sourcePath: "ui-persist-fail.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
+        "",
+      ),
+      (error: any) => {
+        assert.equal(error.name, "AggregateError");
+        assert.match(error.message, /failed and failed to report error result/);
+        const errors = error.errors as any[];
+        const startError = errors.find((candidate) => candidate.operation === "start");
+        const reportError = errors.find((candidate) => candidate.operation === "error-result");
+        assert.ok(startError);
+        assert.ok(reportError);
+        assert.match(startError.message, /workflow=\/ui-persist-fail/);
+        assert.match(startError.message, /sessionPath=/);
+        assert.equal(startError.sessionPath, sessionFile);
+        assert.equal(reportError.sessionPath, sessionFile);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(requestCount, 0);
+  assert.deepEqual(entries.map((entry) => entry.customType), ["pi-workflows-progress"]);
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.equal(messages[0].display, true);
+  assert.equal(messages[0].details.isError, true);
+  assert.match(messages[0].details.error, /Failed to persist workflow session snapshot/);
+});
+
+test("UI fork workflow fails before dispatch when persistence machinery is unavailable", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const entries: any[] = [];
+  let requestCount = 0;
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+    appendEntry(customType: string, data: any) {
+      entries.push({ customType, data });
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+    },
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  events.on(REQUEST_EVENT, () => {
+    requestCount += 1;
+  });
+
+  try {
+    await assert.rejects(
+      runWorkflow(
+        pi as any,
+        ctx as any,
+        { name: "ui-missing-persistence", sourcePath: "ui-missing-persistence.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
+        "",
+      ),
+      (error: any) => {
+        assert.equal(error.name, "WorkflowPersistenceError");
+        assert.match(error.message, /operation=start/);
+        assert.match(error.message, /session file path unavailable/);
+        assert.match(error.message, /session rewrite hook unavailable/);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(requestCount, 0);
+  assert.deepEqual(entries.map((entry) => entry.customType), ["pi-workflows-progress"]);
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.equal(messages[0].display, true);
+  assert.equal(messages[0].details.isError, true);
+});
+
+test("non-UI fork workflow tolerates startup session snapshot persistence failures", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  let requestCount = 0;
+  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-non-ui-persist-fail-"));
+  const sessionFile = join(sessionDir, "session.jsonl");
+  let rewriteCount = 0;
+  const sessionManager = {
+    getSessionFile() {
+      return sessionFile;
+    },
+    _rewriteFile() {
+      rewriteCount += 1;
+      if (rewriteCount === 1) throw new Error("disk full");
+    },
+  };
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  events.on(REQUEST_EVENT, (data) => {
+    requestCount += 1;
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: false,
+        result: { content: [{ type: "text", text: "fork ok" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  try {
+    await runWorkflow(
+      pi as any,
+      { ...createCtx(), sessionManager } as any,
+      { name: "non-ui-fork-persist", sourcePath: "non-ui-fork-persist.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
+      "",
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(requestCount, 1);
+  assert.equal(rewriteCount, 2);
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
+  assert.deepEqual(messages.map((message) => message.display), [true, true]);
+  assert.match(messages[1].content, /fork ok/);
+});
+
+test("workflow with incomplete session persistence still completes after final result and logs degradation", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const diagnostics: string[] = [];
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    sessionManager: {
+      getSessionFile() {
+        return undefined;
+      },
+    },
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+    },
+  };
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: false,
+        result: { content: [{ type: "text", text: "partial persistence ok" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  const originalConsoleError = console.error;
+  console.error = (message?: any) => diagnostics.push(String(message));
+  try {
+    await runWorkflow(
+      pi as any,
+      ctx as any,
+      { name: "partial-persistence", sourcePath: "partial-persistence.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+      "",
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.equal(messages[0].display, true);
+  assert.match(messages[0].content, /partial persistence ok/);
+  assert.ok(diagnostics.some((message) => /Skipped workflow session snapshot persistence/.test(message)));
+});
+
+test("UI workflow surfaces final result persistence failures without failing successful workflow", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  const notifications: any[] = [];
+  let requestCount = 0;
+  let rewriteCount = 0;
+  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-final-persist-fail-"));
+  const sessionFile = join(sessionDir, "session.jsonl");
+  const sessionManager = {
+    getSessionFile() {
+      return sessionFile;
+    },
+    _rewriteFile() {
+      rewriteCount += 1;
+      if (rewriteCount === 2) throw new Error("final write failed");
+    },
+  };
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    sessionManager,
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify(message: string, level: string) {
+        notifications.push({ message, level });
+      },
+      setStatus() {},
+      setWidget() {},
+    },
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  events.on(REQUEST_EVENT, (data) => {
+    requestCount += 1;
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: false,
+        result: { content: [{ type: "text", text: "final ok" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  try {
+    await runWorkflow(
+      pi as any,
+      ctx as any,
+      { name: "final-persist-fail", sourcePath: "final-persist-fail.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+      "",
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(requestCount, 1);
+  assert.equal(rewriteCount, 2);
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.match(messages[0].content, /final ok/);
+  assert.ok(notifications.some((notification) => notification.level === "error" && /operation=result/.test(notification.message)));
+  assert.equal(notifications.some((notification) => notification.level === "success"), false);
+});
+
+test("workflow error plus final result persistence failure is aggregated", async () => {
+  const events = createEvents();
+  const messages: any[] = [];
+  let rewriteCount = 0;
+  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-error-final-persist-fail-"));
+  const sessionFile = join(sessionDir, "session.jsonl");
+  const sessionManager = {
+    getSessionFile() {
+      return sessionFile;
+    },
+    _rewriteFile() {
+      rewriteCount += 1;
+      if (rewriteCount === 2) throw new Error("final write failed");
+    },
+  };
+  const pi = {
+    events,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+  };
+  const ctx = {
+    ...createCtx(),
+    hasUI: true,
+    sessionManager,
+    ui: {
+      supportsWorkflowWidgets: true,
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+    },
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string };
+    setTimeout(() => {
+      events.emit(STARTED_EVENT, { requestId: request.requestId });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: true,
+        errorText: "subagent failed",
+        result: { content: [{ type: "text", text: "boom" }], details: { results: [] } },
+      });
+    }, 0);
+  });
+
+  try {
+    await assert.rejects(
+      runWorkflow(
+        pi as any,
+        ctx as any,
+        { name: "error-final-persist-fail", sourcePath: "error-final-persist-fail.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
+        "",
+      ),
+      (error: any) => {
+        assert.equal(error.name, "AggregateError");
+        assert.match(error.message, /failed and failed to report final result/);
+        assert.ok(error.errors.some((candidate: any) => /subagent failed/.test(candidate.message)));
+        const persistenceError = error.errors.find((candidate: any) => candidate.operation === "result");
+        assert.ok(persistenceError);
+        assert.equal(persistenceError.sessionPath, sessionFile);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(rewriteCount, 2);
+  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
+  assert.equal(messages[0].details.isError, true);
 });
 
 test("workflow message renderers expose live progress and expanded agent details", async () => {

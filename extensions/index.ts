@@ -206,24 +206,244 @@ type SessionSnapshotContext = {
   };
 };
 
+type WorkflowUIContext = SessionSnapshotContext & {
+  hasUI?: boolean;
+  ui?: {
+    notify?: (message: string, level?: string) => void;
+    setStatus?: (key: string, text: string | undefined) => void;
+    setWidget?: (key: string, content: unknown, options?: unknown) => void;
+    supportsWorkflowWidgets?: boolean;
+    supportsComponentWidgets?: boolean;
+    capabilities?: {
+      workflowWidgets?: boolean;
+      componentWidgets?: boolean;
+      tuiWidgets?: boolean;
+    };
+  };
+};
+
 type WorkflowOutboundMessage = Parameters<ExtensionAPI["sendMessage"]>[0];
 
-function persistWorkflowSessionSnapshot(ctx: SessionSnapshotContext | undefined): void {
-  try {
-    const sessionManager = ctx?.sessionManager;
-    const sessionFile = sessionManager?.getSessionFile?.();
-    if (!sessionFile || typeof sessionManager?._rewriteFile !== "function") return;
-    mkdirSync(dirname(sessionFile), { recursive: true });
-    sessionManager._rewriteFile();
-    sessionManager.flushed = true;
-  } catch (error) {
-    console.error("Failed to persist workflow session snapshot:", error);
+type WorkflowPersistenceDiagnostics = {
+  workflowName?: string;
+  requestId?: string;
+  operation?: string;
+};
+
+type WorkflowPersistenceOptions = WorkflowPersistenceDiagnostics & {
+  throwOnPersistenceFailure?: boolean;
+  requirePersistence?: boolean;
+};
+
+type WorkflowProgressMessageOptions = WorkflowPersistenceOptions & {
+  persistHiddenMessage?: boolean;
+};
+
+type WorkflowPersistenceResult =
+  | { ok: true; sessionPath?: string; skipped?: boolean }
+  | { ok: false; error: WorkflowPersistenceError; sessionPath?: string };
+
+class WorkflowPersistenceError extends Error {
+  workflowName?: string;
+  requestId?: string;
+  operation?: string;
+  sessionPath?: string;
+
+  constructor(message: string, cause: unknown, diagnostics: WorkflowPersistenceDiagnostics & { sessionPath?: string }) {
+    super(message, { cause });
+    this.name = "WorkflowPersistenceError";
+    this.workflowName = diagnostics.workflowName;
+    this.requestId = diagnostics.requestId;
+    this.operation = diagnostics.operation;
+    this.sessionPath = diagnostics.sessionPath;
   }
 }
 
-function sendWorkflowMessage(pi: ExtensionAPI, ctx: SessionSnapshotContext | undefined, message: WorkflowOutboundMessage): void {
+function formatPersistenceFailureMessage(
+  diagnostics: WorkflowPersistenceDiagnostics & { sessionPath?: string },
+  reason?: string,
+): string {
+  const details = [
+    diagnostics.workflowName ? `workflow=/${diagnostics.workflowName}` : undefined,
+    diagnostics.requestId ? `requestId=${diagnostics.requestId}` : undefined,
+    diagnostics.operation ? `operation=${diagnostics.operation}` : undefined,
+    diagnostics.sessionPath ? `sessionPath=${diagnostics.sessionPath}` : undefined,
+  ].filter(Boolean).join(" ");
+  return `Failed to persist workflow session snapshot${details ? ` (${details})` : ""}${reason ? `: ${reason}` : ""}.`;
+}
+
+function createWorkflowPersistenceError(
+  cause: unknown,
+  diagnostics: WorkflowPersistenceDiagnostics & { sessionPath?: string },
+  reason?: string,
+): WorkflowPersistenceError {
+  return new WorkflowPersistenceError(
+    formatPersistenceFailureMessage(diagnostics, reason),
+    cause,
+    diagnostics,
+  );
+}
+
+function formatPersistenceSkippedMessage(
+  diagnostics: WorkflowPersistenceDiagnostics & { sessionPath?: string },
+  reason: string,
+): string {
+  const details = [
+    diagnostics.workflowName ? `workflow=/${diagnostics.workflowName}` : undefined,
+    diagnostics.requestId ? `requestId=${diagnostics.requestId}` : undefined,
+    diagnostics.operation ? `operation=${diagnostics.operation}` : undefined,
+    diagnostics.sessionPath ? `sessionPath=${diagnostics.sessionPath}` : undefined,
+  ].filter(Boolean).join(" ");
+  return `Skipped workflow session snapshot persistence${details ? ` (${details})` : ""}: ${reason}.`;
+}
+
+function logWorkflowDiagnostic(message: string, error?: unknown): void {
+  if (error === undefined) console.error(message);
+  else console.error(message, error);
+}
+
+function toError(error: unknown, fallback: string): Error {
+  return error instanceof Error ? error : new Error(error === undefined ? fallback : String(error));
+}
+
+function persistWorkflowSessionSnapshot(
+  ctx: SessionSnapshotContext | undefined,
+  options: WorkflowPersistenceOptions = {},
+): WorkflowPersistenceResult {
+  const sessionManager = ctx?.sessionManager;
+  let sessionFile: string | undefined;
+  try {
+    sessionFile = sessionManager?.getSessionFile?.();
+  } catch (error) {
+    logWorkflowDiagnostic(formatPersistenceFailureMessage(options, "session file path lookup failed"), error);
+    if (!options.requirePersistence) return { ok: true, skipped: true };
+    const persistenceError = createWorkflowPersistenceError(
+      error,
+      options,
+      "session file path lookup failed",
+    );
+    return { ok: false, error: persistenceError };
+  }
+  if (!sessionFile || typeof sessionManager?._rewriteFile !== "function") {
+    const missing = [
+      sessionFile ? undefined : "session file path unavailable",
+      typeof sessionManager?._rewriteFile === "function" ? undefined : "session rewrite hook unavailable",
+    ].filter(Boolean).join("; ");
+    if (!options.requirePersistence) {
+      if (sessionManager) logWorkflowDiagnostic(formatPersistenceSkippedMessage({ ...options, sessionPath: sessionFile }, missing));
+      return { ok: true, sessionPath: sessionFile, skipped: true };
+    }
+    const persistenceError = createWorkflowPersistenceError(
+      new Error(missing),
+      { ...options, sessionPath: sessionFile },
+      missing,
+    );
+    logWorkflowDiagnostic(persistenceError.message);
+    return { ok: false, error: persistenceError, sessionPath: sessionFile };
+  }
+  try {
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    sessionManager._rewriteFile();
+    sessionManager.flushed = true;
+    return { ok: true, sessionPath: sessionFile };
+  } catch (error) {
+    const persistenceError = createWorkflowPersistenceError(
+      error,
+      { ...options, sessionPath: sessionFile },
+    );
+    logWorkflowDiagnostic(persistenceError.message, error);
+    return { ok: false, error: persistenceError, sessionPath: sessionFile };
+  }
+}
+
+function supportsWorkflowWidgetSurface(ctx: WorkflowUIContext | undefined): boolean {
+  if (!ctx?.hasUI || typeof ctx.ui?.setWidget !== "function") return false;
+  if (ctx.ui.supportsWorkflowWidgets === true || ctx.ui.supportsComponentWidgets === true) return true;
+  if (ctx.ui.capabilities?.workflowWidgets === true || ctx.ui.capabilities?.componentWidgets === true || ctx.ui.capabilities?.tuiWidgets === true) return true;
+  if (ctx.ui.supportsWorkflowWidgets === false || ctx.ui.supportsComponentWidgets === false) return false;
+  if (ctx.ui.capabilities?.workflowWidgets === false || ctx.ui.capabilities?.componentWidgets === false || ctx.ui.capabilities?.tuiWidgets === false) return false;
+  try {
+    return /\bsetExtensionWidget\b/.test(Function.prototype.toString.call(ctx.ui.setWidget));
+  } catch (error) {
+    logWorkflowDiagnostic("Failed to probe workflow widget support; falling back to visible progress messages.", error);
+    return false;
+  }
+}
+
+function notifyWorkflowPersistenceFailure(
+  ctx: WorkflowUIContext | undefined,
+  error: WorkflowPersistenceError,
+): void {
+  if (!ctx?.hasUI) return;
+  try {
+    ctx.ui?.notify?.(error.message, "error");
+  } catch {
+    // Preserve the workflow failure; UI notification failures are secondary.
+  }
+}
+
+function sendWorkflowMessage(
+  pi: ExtensionAPI,
+  ctx: SessionSnapshotContext | undefined,
+  message: WorkflowOutboundMessage,
+  options: WorkflowPersistenceOptions = {},
+): WorkflowPersistenceResult {
   pi.sendMessage(message);
-  persistWorkflowSessionSnapshot(ctx);
+  const persistence = persistWorkflowSessionSnapshot(ctx, options);
+  if (!persistence.ok && options.throwOnPersistenceFailure) throw persistence.error;
+  return persistence;
+}
+
+function persistWorkflowSessionOnly(
+  ctx: SessionSnapshotContext | undefined,
+  options: WorkflowPersistenceOptions = {},
+): WorkflowPersistenceResult {
+  const persistence = persistWorkflowSessionSnapshot(ctx, options);
+  if (!persistence.ok && options.throwOnPersistenceFailure) throw persistence.error;
+  return persistence;
+}
+
+function appendWorkflowSessionEntry(
+  pi: ExtensionAPI,
+  ctx: SessionSnapshotContext | undefined,
+  customType: string,
+  data: unknown,
+  options: WorkflowPersistenceOptions = {},
+): WorkflowPersistenceResult {
+  try {
+    pi.appendEntry(customType, data);
+  } catch (error) {
+    const appendError = createWorkflowPersistenceError(
+      error,
+      options,
+      "session-only workflow entry append failed",
+    );
+    logWorkflowDiagnostic(appendError.message, error);
+    if (options.throwOnPersistenceFailure) throw appendError;
+    return { ok: false, error: appendError };
+  }
+  const persistence = persistWorkflowSessionSnapshot(ctx, options);
+  if (!persistence.ok && options.throwOnPersistenceFailure) throw persistence.error;
+  return persistence;
+}
+
+function sendWorkflowProgressMessage(
+  pi: ExtensionAPI,
+  ctx: WorkflowUIContext | undefined,
+  message: WorkflowOutboundMessage,
+  options: WorkflowProgressMessageOptions = {},
+): WorkflowPersistenceResult {
+  if (supportsWorkflowWidgetSurface(ctx)) {
+    if (options.persistHiddenMessage) {
+      return appendWorkflowSessionEntry(pi, ctx, message.customType, {
+        content: message.content,
+        details: message.details,
+        display: false,
+      }, options);
+    }
+    return persistWorkflowSessionOnly(ctx, options);
+  }
+  return sendWorkflowMessage(pi, ctx, { ...message, display: true }, options);
 }
 
 function deleteWorkflowLiveState(requestId: string): void {
@@ -1461,10 +1681,9 @@ export async function requestSubagentRun(
         currentTool: existing?.currentTool,
         toolCount: existing?.toolCount,
       });
-      if (ctx.hasUI) {
-        ctx.ui.setStatus("pi-workflows", "running workflow... · live details above editor");
-        setWorkflowProgressWidget(ctx, workflowName, requestId, { requestId, status: "running", progress: [] });
-      }
+      const useWorkflowWidget = supportsWorkflowWidgetSurface(ctx);
+      if (ctx.hasUI) ctx.ui.setStatus?.("pi-workflows", useWorkflowWidget ? "running workflow... · live details above editor" : "running workflow...");
+      if (useWorkflowWidget) setWorkflowProgressWidget(ctx, workflowName, requestId, { requestId, status: "running", progress: [] });
     };
 
     const onResponse = (data: unknown) => {
@@ -1499,10 +1718,9 @@ export async function requestSubagentRun(
         currentTool: tool,
         toolCount: count,
       });
-      if (ctx.hasUI) {
-        ctx.ui.setStatus("pi-workflows", `${label}${count} tools${tool ? ` · ${tool}` : ""} · live details above editor`);
-        setWorkflowProgressWidget(ctx, workflowName, requestId, update);
-      }
+      const useWorkflowWidget = supportsWorkflowWidgetSurface(ctx);
+      if (ctx.hasUI) ctx.ui.setStatus?.("pi-workflows", `${label}${count} tools${tool ? ` · ${tool}` : ""}${useWorkflowWidget ? " · live details above editor" : ""}`);
+      if (useWorkflowWidget) setWorkflowProgressWidget(ctx, workflowName, requestId, update);
     };
 
     const unsubStarted = pi.events.on(SLASH_SUBAGENT_STARTED_EVENT, onStarted) as () => void;
@@ -1534,11 +1752,21 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
       updatedAt: Date.now(),
       progress: [],
     });
-    sendWorkflowMessage(pi, ctx, {
+    const useWorkflowWidget = supportsWorkflowWidgetSurface(ctx);
+    const requireForkPersistence = ctx.hasUI && params.context === "fork";
+    if (useWorkflowWidget) setWorkflowProgressWidget(ctx, workflow.name, requestId, { requestId, status: "starting", progress: [] });
+    sendWorkflowProgressMessage(pi, ctx, {
       customType: WORKFLOW_PROGRESS_MESSAGE_TYPE,
       content: `▶ Running workflow /${workflow.name}...`,
       display: true,
       details: { workflow: workflow.name, sourcePath: workflow.sourcePath, requestId, params: snapshotParams(params), status: "starting", progress: [] },
+    }, {
+      workflowName: workflow.name,
+      requestId,
+      operation: "start",
+      persistHiddenMessage: useWorkflowWidget && requireForkPersistence,
+      requirePersistence: requireForkPersistence,
+      throwOnPersistenceFailure: requireForkPersistence,
     });
     let response = await requestSubagentRun(pi, ctx, requestId, params, workflow.name);
     let retriedFromFork = false;
@@ -1574,11 +1802,16 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
         updatedAt: Date.now(),
         progress: [],
       });
-      sendWorkflowMessage(pi, ctx, {
+      if (useWorkflowWidget) setWorkflowProgressWidget(ctx, workflow.name, requestId, { requestId, status: "starting", progress: [] });
+      sendWorkflowProgressMessage(pi, ctx, {
         customType: WORKFLOW_PROGRESS_MESSAGE_TYPE,
         content: `↻ Workflow /${workflow.name}: forked context unavailable; retrying with fresh context...`,
         display: true,
         details: { workflow: workflow.name, sourcePath: workflow.sourcePath, requestId, params: snapshotParams(params), retry: "fresh", status: "starting", progress: [] },
+      }, {
+        workflowName: workflow.name,
+        requestId,
+        operation: "retry-fresh",
       });
       response = await requestSubagentRun(pi, ctx, requestId, params, workflow.name);
     }
@@ -1587,6 +1820,8 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
     const effectiveIsError = response.isError && !recoveredCompletionGuard;
     const text = formatResponseText(response, retriedFromFork, recoveredCompletionGuard);
     const errorText = response.isError ? extractErrorText(response) : undefined;
+    let resultPersistenceFailure: WorkflowPersistenceError | undefined;
+    let resultReportingFailure: Error | undefined;
     try {
       const existingState = workflowLiveStates.get(requestId);
       const finalProgress = response.result.details?.progress?.length ? response.result.details.progress : existingState?.progress ?? [];
@@ -1599,7 +1834,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
           progress: finalProgress,
         });
       }
-      sendWorkflowMessage(pi, ctx, {
+      const persistence = sendWorkflowMessage(pi, ctx, {
         customType: WORKFLOW_RESULT_MESSAGE_TYPE,
         content: text,
         display: true,
@@ -1615,15 +1850,36 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
           recoveredCompletionGuard,
           result: finalResult,
         },
+      }, {
+        workflowName: workflow.name,
+        requestId,
+        operation: "result",
       });
+      if (!persistence.ok) {
+        resultPersistenceFailure = persistence.error;
+        notifyWorkflowPersistenceFailure(ctx, persistence.error);
+      }
     } catch (error) {
-      if (!effectiveIsError) throw error;
-      // Preserve the original subagent failure; result-rendering failures are secondary.
+      if (error instanceof WorkflowPersistenceError) {
+        resultPersistenceFailure = error;
+        notifyWorkflowPersistenceFailure(ctx, error);
+      } else {
+        resultReportingFailure = toError(error, "final workflow result reporting failed");
+        logWorkflowDiagnostic(`Workflow /${workflow.name} failed to report final result.`, resultReportingFailure);
+      }
+      if (!effectiveIsError && resultReportingFailure) throw resultReportingFailure;
     }
     if (effectiveIsError) {
-      responseFailure = new Error(`Workflow /${workflow.name} failed: ${errorText}`);
+      const workflowError = new Error(`Workflow /${workflow.name} failed: ${errorText}`);
+      const secondaryFailures = [resultReportingFailure, resultPersistenceFailure].filter((failure): failure is Error => Boolean(failure));
+      responseFailure = secondaryFailures.length > 0
+        ? new AggregateError(
+          [workflowError, ...secondaryFailures],
+          `Workflow /${workflow.name} failed and failed to report final result: ${errorText}`,
+        )
+        : workflowError;
       if (ctx.hasUI) ctx.ui.notify(errorText ?? "Workflow failed", "error");
-    } else if (ctx.hasUI) {
+    } else if (ctx.hasUI && !resultPersistenceFailure) {
       ctx.ui.notify(
         recoveredCompletionGuard
           ? `Workflow /${workflow.name} completed with recovered review output`
@@ -1633,17 +1889,33 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    let reportingPersistenceFailure: WorkflowPersistenceError | undefined;
+    let reportingFailure: Error | undefined;
     try {
       const existingState = workflowLiveStates.get(requestId);
       if (existingState) setWorkflowLiveState({ ...existingState, status: "failed", updatedAt: Date.now() });
-      sendWorkflowMessage(pi, ctx, {
+      const persistence = sendWorkflowMessage(pi, ctx, {
         customType: WORKFLOW_RESULT_MESSAGE_TYPE,
         content: `Workflow /${workflow.name} failed: ${message}`,
         display: true,
         details: { workflow: workflow.name, sourcePath: workflow.sourcePath, requestId, params: snapshotParams(params), isError: true, error: message },
+      }, {
+        workflowName: workflow.name,
+        requestId,
+        operation: "error-result",
       });
-    } catch {
-      // Preserve the original workflow failure; reporting failures are secondary.
+      if (!persistence.ok) {
+        reportingPersistenceFailure = persistence.error;
+        notifyWorkflowPersistenceFailure(ctx, persistence.error);
+      }
+    } catch (reportingError) {
+      if (reportingError instanceof WorkflowPersistenceError) {
+        reportingPersistenceFailure = reportingError;
+        notifyWorkflowPersistenceFailure(ctx, reportingError);
+      } else {
+        reportingFailure = toError(reportingError, "workflow error result reporting failed");
+        logWorkflowDiagnostic(`Workflow /${workflow.name} failed to report error result.`, reportingFailure);
+      }
     }
     if (ctx.hasUI) {
       try {
@@ -1652,12 +1924,16 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
         // Preserve the original workflow failure; UI notification failures are secondary.
       }
     }
+    if (reportingPersistenceFailure || reportingFailure) {
+      throw new AggregateError(
+        [error, reportingFailure, reportingPersistenceFailure].filter((failure): failure is Error => Boolean(failure)),
+        `Workflow /${workflow.name} failed and failed to report error result: ${message}`,
+      );
+    }
     throw error;
   } finally {
-    if (ctx.hasUI) {
-      ctx.ui.setStatus("pi-workflows", undefined);
-      ctx.ui.setWidget("pi-workflows", undefined);
-    }
+    if (ctx.hasUI) ctx.ui.setStatus?.("pi-workflows", undefined);
+    if (supportsWorkflowWidgetSurface(ctx)) ctx.ui.setWidget?.("pi-workflows", undefined);
   }
   if (responseFailure) throw responseFailure;
 }

@@ -69,7 +69,7 @@ Generic runner:
 /workflow --list
 ```
 
-While a workflow runs, `pi-workflows` shows a compact live TUI widget with active agents, tool counts, current tools, token/duration stats, and a `Ctrl+O` hint. The workflow progress and final result are also rendered as expandable conversation cards: press **Ctrl+O** to show per-agent progress, recent tools/output, child session paths, saved outputs, and artifact paths. When the workflow completes, it renders the final successful subagent output back into the conversation instead of only showing the `pi-subagents` chain summary. If the underlying subagent run fails, it renders failure text and propagates the failure instead of showing a stale successful step output.
+While a workflow runs in the TUI, `pi-workflows` shows a single compact live widget with active agents, tool counts, current tools, and token/duration stats. When the workflow completes, it renders the final successful subagent output back into the conversation as an expandable result card instead of only showing the `pi-subagents` chain summary. Press **Ctrl+O** on the final card to show per-agent progress, recent tools/output, child session paths, saved outputs, and artifact paths. If the underlying subagent run fails, it renders failure text and propagates the failure instead of showing a stale successful step output.
 
 Runtime flags:
 
@@ -146,7 +146,7 @@ Supported template variables in task strings:
 
 For code-review workflows, `context: "fresh"` is usually the safest default: reviewers can inspect the repository directly, and the workflow does not depend on Pi being able to fork the current conversation session.
 
-Use `context: "fork"` when the workflow genuinely needs the parent conversation history. Pi's forked subagent context requires a persisted parent session and a leaf entry that exists in the session file. If that is unavailable, `pi-workflows` retries once with `context: "fresh"` by default and includes a note in the result. To make fork failures hard errors, set:
+Use `context: "fork"` when the workflow genuinely needs the parent conversation history. Pi's forked subagent context requires a persisted parent session and a leaf entry that exists in the session file. In UI sessions, `pi-workflows` creates or persists a startup entry before dispatching forked workflows; if that entry cannot be persisted, the workflow fails before launch rather than silently losing parent history. If fork creation is unavailable after that, `pi-workflows` retries once with `context: "fresh"` by default and includes a note in the result. Non-required workflow persistence is best-effort: if session persistence machinery is unavailable for non-fork/final-result paths, the workflow continues and logs a diagnostic instead of turning successful work into a failure. To make fork failures hard errors, set:
 
 ```jsonc
 { "forkFallback": "error" }
