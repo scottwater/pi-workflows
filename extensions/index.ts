@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, MessageRenderOptions, Theme } from "@mariozechner/pi-coding-agent";
-import { Box, Container, Markdown, Spacer, Text, type Component, type MarkdownTheme } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext, MessageRenderOptions, Theme } from "@earendil-works/pi-coding-agent";
+import { Box, Container, Markdown, Spacer, Text, type Component, type MarkdownTheme } from "@earendil-works/pi-tui";
 
 type ContextMode = "fresh" | "fork";
 type AgentScope = "user" | "project" | "both";
@@ -243,6 +243,19 @@ type WorkflowPersistenceResult =
   | { ok: true; sessionPath?: string; skipped?: boolean }
   | { ok: false; error: WorkflowPersistenceError; sessionPath?: string };
 
+function isPersistenceFailure(
+  result: WorkflowPersistenceResult,
+): result is Extract<WorkflowPersistenceResult, { ok: false }> {
+  return result.ok === false;
+}
+
+function throwIfRequestedPersistenceFailure(
+  result: WorkflowPersistenceResult,
+  options: WorkflowPersistenceOptions,
+): void {
+  if (isPersistenceFailure(result) && options.throwOnPersistenceFailure) throw result.error;
+}
+
 class WorkflowPersistenceError extends Error {
   workflowName?: string;
   requestId?: string;
@@ -390,7 +403,7 @@ function sendWorkflowMessage(
 ): WorkflowPersistenceResult {
   pi.sendMessage(message);
   const persistence = persistWorkflowSessionSnapshot(ctx, options);
-  if (!persistence.ok && options.throwOnPersistenceFailure) throw persistence.error;
+  throwIfRequestedPersistenceFailure(persistence, options);
   return persistence;
 }
 
@@ -399,7 +412,7 @@ function persistWorkflowSessionOnly(
   options: WorkflowPersistenceOptions = {},
 ): WorkflowPersistenceResult {
   const persistence = persistWorkflowSessionSnapshot(ctx, options);
-  if (!persistence.ok && options.throwOnPersistenceFailure) throw persistence.error;
+  throwIfRequestedPersistenceFailure(persistence, options);
   return persistence;
 }
 
@@ -423,7 +436,7 @@ function appendWorkflowSessionEntry(
     return { ok: false, error: appendError };
   }
   const persistence = persistWorkflowSessionSnapshot(ctx, options);
-  if (!persistence.ok && options.throwOnPersistenceFailure) throw persistence.error;
+  throwIfRequestedPersistenceFailure(persistence, options);
   return persistence;
 }
 
@@ -1606,7 +1619,7 @@ function normalizeSubagentResponse(data: unknown, workflowName: string, requestI
     requestId,
     result,
     isError: data.isError === true || resultHasFailure(result),
-    errorText: data.errorText,
+    errorText: typeof data.errorText === "string" ? data.errorText : undefined,
   };
 }
 
@@ -1855,7 +1868,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
         requestId,
         operation: "result",
       });
-      if (!persistence.ok) {
+      if (isPersistenceFailure(persistence)) {
         resultPersistenceFailure = persistence.error;
         notifyWorkflowPersistenceFailure(ctx, persistence.error);
       }
@@ -1884,7 +1897,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
         recoveredCompletionGuard
           ? `Workflow /${workflow.name} completed with recovered review output`
           : `Workflow /${workflow.name} completed`,
-        recoveredCompletionGuard ? "warning" : "success",
+        recoveredCompletionGuard ? "warning" : "info",
       );
     }
   } catch (error) {
@@ -1904,7 +1917,7 @@ export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext
         requestId,
         operation: "error-result",
       });
-      if (!persistence.ok) {
+      if (isPersistenceFailure(persistence)) {
         reportingPersistenceFailure = persistence.error;
         notifyWorkflowPersistenceFailure(ctx, persistence.error);
       }
