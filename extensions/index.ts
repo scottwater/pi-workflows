@@ -9,6 +9,7 @@ type ContextMode = "fresh" | "fork";
 type AgentScope = "user" | "project" | "both";
 type ModelPolicy = "agent" | "workflow";
 type ForkFallback = "fresh" | "error";
+type SkillSpec = string | string[] | false;
 
 type SequentialStep = {
   agent: string;
@@ -17,8 +18,7 @@ type SequentialStep = {
   output?: string | false;
   reads?: string[] | false;
   progress?: boolean;
-  skill?: string | string[] | false;
-  skills?: string[] | false;
+  skill?: SkillSpec;
   model?: string;
 };
 
@@ -46,6 +46,7 @@ type Workflow = {
   chainDir?: string;
   agentScope?: AgentScope;
   model?: string;
+  skill?: SkillSpec;
   chain?: ChainStep[];
   tasks?: ParallelTask[];
   agent?: string;
@@ -69,6 +70,7 @@ type SubagentParamsLike = {
   agent?: string;
   task?: string;
   model?: string;
+  skill?: SkillSpec;
   chain?: ChainStep[];
   tasks?: ParallelTask[];
   context?: ContextMode;
@@ -610,12 +612,37 @@ function assertOptionalStringArrayOrFalse(value: unknown, fieldPath: string): st
   return value;
 }
 
-function assertOptionalSkill(value: unknown, fieldPath: string): string | string[] | false | undefined {
+function splitSkillString(value: string, fieldPath: string): string[] {
+  const tokens = value.split(",").map((entry) => entry.trim());
+  if (tokens.length === 0 || tokens.some((entry) => !entry)) {
+    throw new Error(`${fieldPath} must include at least one non-empty skill name and must not contain empty comma-separated entries.`);
+  }
+  return tokens;
+}
+
+function assertOptionalSkill(value: unknown, fieldPath: string): SkillSpec | undefined {
   if (value === undefined) return undefined;
   if (value === false) return false;
-  if (typeof value === "string" && value.trim()) return value;
-  if (Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim())) return value;
-  throw new Error(`${fieldPath} must be false, a non-empty string, or an array of non-empty strings.`);
+  if (typeof value === "string") {
+    const tokens = splitSkillString(value, fieldPath);
+    return tokens.length === 1 ? tokens[0] : tokens;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 0 && value.every((entry) => typeof entry === "string" && entry.trim())) {
+      return value.map((entry) => entry.trim());
+    }
+    throw new Error(`${fieldPath} must include at least one non-empty skill name.`);
+  }
+  throw new Error(`${fieldPath} must be false, a non-empty string, or a non-empty array of non-empty strings.`);
+}
+
+function normalizeSkillAlias(value: Record<string, unknown>, fieldPath: string): SkillSpec | undefined {
+  if (value.skill !== undefined && value.skills !== undefined) {
+    throw new Error(`${fieldPath} must not define both skill and skills.`);
+  }
+  return value.skill !== undefined
+    ? assertOptionalSkill(value.skill, `${fieldPath}.skill`)
+    : assertOptionalSkill(value.skills, `${fieldPath}.skills`);
 }
 
 function assertOptionalPositiveInteger(value: unknown, fieldPath: string): number | undefined {
@@ -633,8 +660,7 @@ function validateSequentialStep(value: unknown, fieldPath: string): SequentialSt
     output: value.output === false ? false : assertOptionalString(value.output, `${fieldPath}.output`),
     reads: assertOptionalStringArrayOrFalse(value.reads, `${fieldPath}.reads`),
     progress: assertOptionalBoolean(value.progress, `${fieldPath}.progress`),
-    skill: assertOptionalSkill(value.skill, `${fieldPath}.skill`),
-    skills: assertOptionalStringArrayOrFalse(value.skills, `${fieldPath}.skills`),
+    skill: normalizeSkillAlias(value, fieldPath),
     model: assertOptionalString(value.model, `${fieldPath}.model`),
   };
   for (const key of Object.keys(step) as Array<keyof SequentialStep>) {
@@ -713,6 +739,7 @@ export function parseWorkflowFile(path: string): Workflow | undefined {
     chainDir: assertOptionalString(parsed.chainDir, `${workflowPath}.chainDir`),
     agentScope: assertOptionalEnum(parsed.agentScope, `${workflowPath}.agentScope`, ["user", "project", "both"] as const),
     model: assertOptionalString(parsed.model, `${workflowPath}.model`),
+    skill: normalizeSkillAlias(parsed, workflowPath),
     chain,
     tasks,
     agent,
@@ -907,6 +934,27 @@ function renderSequentialStep(step: SequentialStep, rawArgs: string, ctx: Extens
   };
 }
 
+function skillSpecToArray(skill: SkillSpec | undefined): string[] | false | undefined {
+  if (skill === undefined || skill === false) return skill;
+  const values = Array.isArray(skill) ? skill.map((name) => name.trim()) : splitSkillString(skill, "skill");
+  return [...new Set(values)];
+}
+
+function mergeSkillSpecs(base: SkillSpec | undefined, override: SkillSpec | undefined): SkillSpec | undefined {
+  if (override === false) return false;
+  const baseValues = skillSpecToArray(base);
+  const overrideValues = skillSpecToArray(override);
+  if (overrideValues === false) return false;
+  const merged = [...(baseValues && baseValues !== false ? baseValues : []), ...(overrideValues ?? [])];
+  return merged.length > 0 ? [...new Set(merged)] : undefined;
+}
+
+function applyTaskSkillDefault(task: ParallelTask, skill: SkillSpec | undefined): ParallelTask {
+  if (skill === undefined) return task;
+  const merged = mergeSkillSpecs(skill, task.skill);
+  return merged === undefined ? task : { ...task, skill: merged };
+}
+
 function isParallelStep(step: ChainStep): step is ParallelStep {
   return "parallel" in step && Array.isArray((step as ParallelStep).parallel);
 }
@@ -949,11 +997,17 @@ export function buildSubagentParams(workflow: Workflow, rawArgs: string, flags: 
     agentScope: flags.agentScope ?? workflow.agentScope ?? "both",
   };
 
+  if (workflow.skill !== undefined && !workflow.tasks) {
+    params.skill = workflow.skill;
+  }
+
   if (workflow.chain) {
     params.chain = workflow.chain.map((step) => renderChainStep(step, rawArgs, ctx, positional));
     params.task = rawArgs;
   } else if (workflow.tasks) {
-    params.tasks = workflow.tasks.map((task) => renderSequentialStep(task, rawArgs, ctx, positional) as ParallelTask);
+    params.tasks = workflow.tasks
+      .map((task) => renderSequentialStep(task, rawArgs, ctx, positional) as ParallelTask)
+      .map((task) => applyTaskSkillDefault(task, workflow.skill));
   } else if (workflow.agent && workflow.task) {
     params.agent = workflow.agent;
     params.model = workflow.model;

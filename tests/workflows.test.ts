@@ -190,6 +190,101 @@ test("model overrides are rejected by agent policy and forwarded by workflow pol
   assert.equal((chainedParams.chain?.[1] as any).parallel[0].model, "google/gemini-3-pro");
 });
 
+test("top-level skill aliases are parsed and forwarded", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-skills-"));
+  const singleFile = join(dir, "single.jsonc");
+  writeFileSync(singleFile, `{ "name": "single-skill", "agent": "delegate", "skills": ["keystone-risk"], "task": "Review {{args}}" }`);
+
+  const singleWorkflow = parseWorkflowFile(singleFile)!;
+  assert.deepEqual(singleWorkflow.skill, ["keystone-risk"]);
+  const singleParams = buildSubagentParams(singleWorkflow, "the diff", { args: "the diff", positional: ["the", "diff"] } as any, createCtx() as any);
+  assert.deepEqual(singleParams.skill, ["keystone-risk"]);
+  assert.equal(singleParams.task, "Review the diff");
+
+  const chainFile = join(dir, "chain.jsonc");
+  writeFileSync(chainFile, `{ "name": "chain-skill", "skill": "shared-skill", "chain": [{ "agent": "delegate", "task": "Review" }] }`);
+  const chainParams = buildSubagentParams(parseWorkflowFile(chainFile)!, "", { args: "", positional: [] } as any, createCtx() as any);
+  assert.equal(chainParams.skill, "shared-skill");
+
+  const commaFile = join(dir, "comma.jsonc");
+  writeFileSync(commaFile, `{ "name": "comma-skill", "agent": "delegate", "skill": "risk, security", "task": "Review" }`);
+  assert.deepEqual(parseWorkflowFile(commaFile)!.skill, ["risk", "security"]);
+});
+
+test("top-level skills are parsed and applied to top-level parallel tasks", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-parallel-skills-"));
+  const file = join(dir, "parallel.jsonc");
+  writeFileSync(file, `{
+    "name": "parallel-skill-test",
+    "skills": ["shared"],
+    "tasks": [
+      { "agent": "one", "task": "one" },
+      { "agent": "two", "task": "two", "skill": false }
+    ]
+  }`);
+
+  const params = buildSubagentParams(parseWorkflowFile(file)!, "", { args: "", positional: [] } as any, createCtx() as any);
+  assert.deepEqual(params.tasks?.[0].skill, ["shared"]);
+  assert.equal(params.tasks?.[1].skill, false);
+  assert.equal(params.skill, undefined);
+});
+
+test("step and task skills aliases are parsed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-nested-skills-"));
+  const chainFile = join(dir, "chain.jsonc");
+  writeFileSync(chainFile, `{
+    "name": "nested-chain-skills",
+    "chain": [
+      { "agent": "first", "task": "one", "skills": ["step-skill"] },
+      { "parallel": [{ "agent": "second", "task": "two", "skills": ["parallel-skill"] }] }
+    ]
+  }`);
+  const chainWorkflow = parseWorkflowFile(chainFile)!;
+  assert.deepEqual((chainWorkflow.chain?.[0] as any).skill, ["step-skill"]);
+  assert.deepEqual((chainWorkflow.chain?.[1] as any).parallel[0].skill, ["parallel-skill"]);
+
+  const tasksFile = join(dir, "tasks.jsonc");
+  writeFileSync(tasksFile, `{
+    "name": "nested-task-skills",
+    "tasks": [{ "agent": "delegate", "task": "t", "skills": ["task-skill"] }]
+  }`);
+  const tasksWorkflow = parseWorkflowFile(tasksFile)!;
+  assert.deepEqual(tasksWorkflow.tasks?.[0].skill, ["task-skill"]);
+});
+
+test("skill and skills aliases are mutually exclusive", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-skill-conflict-"));
+  const cases = [
+    [`{ "name": "root-conflict", "agent": "delegate", "skill": "a", "skills": ["b"], "task": "t" }`, /Workflow root-conflict must not define both skill and skills/],
+    [`{ "name": "task-conflict", "tasks": [{ "agent": "delegate", "task": "t", "skill": "a", "skills": ["b"] }] }`, /Workflow task-conflict\.tasks\[0\] must not define both skill and skills/],
+    [`{ "name": "chain-conflict", "chain": [{ "agent": "delegate", "task": "t", "skill": "a", "skills": ["b"] }] }`, /Workflow chain-conflict\.chain\[0\] must not define both skill and skills/],
+    [`{ "name": "parallel-conflict", "chain": [{ "parallel": [{ "agent": "delegate", "task": "t", "skill": "a", "skills": ["b"] }] }] }`, /Workflow parallel-conflict\.chain\[0\]\.parallel\[0\] must not define both skill and skills/],
+  ] as const;
+
+  cases.forEach(([content, expected], index) => {
+    const file = join(dir, `conflict-${index}.jsonc`);
+    writeFileSync(file, content);
+    assert.throws(() => parseWorkflowFile(file), expected);
+  });
+});
+
+test("malformed skill specs are rejected", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-invalid-skills-"));
+  const cases = [
+    `{ "name": "empty-array", "agent": "delegate", "skills": [], "task": "t" }`,
+    `{ "name": "empty-array-entry", "agent": "delegate", "skills": ["ok", ""], "task": "t" }`,
+    `{ "name": "blank-array-entry", "agent": "delegate", "skills": ["   "], "task": "t" }`,
+    `{ "name": "comma-only", "agent": "delegate", "skill": ",", "task": "t" }`,
+    `{ "name": "empty-comma-token", "agent": "delegate", "skill": "risk,,security", "task": "t" }`,
+  ];
+
+  cases.forEach((content, index) => {
+    const file = join(dir, `invalid-${index}.jsonc`);
+    writeFileSync(file, content);
+    assert.throws(() => parseWorkflowFile(file), /must include at least one non-empty skill name|must not contain empty comma-separated entries/);
+  });
+});
+
 test("workflow custom messages force a session snapshot even before an assistant message exists", async () => {
   const events = createEvents();
   const messages: any[] = [];

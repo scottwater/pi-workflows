@@ -122,6 +122,8 @@ Supported top-level execution fields:
 - `chain` — sequential chain with optional `{ "parallel": [...] }` steps.
 - `tasks` — top-level parallel task list.
 - `agent` + `task` — single subagent task.
+- `skill` — non-empty skill name, comma-separated skill names, non-empty skill-name array, or `false`. For chains this is additive; for top-level parallel tasks it is applied to each task unless that task sets `skill: false`.
+- `skills` — alias for `skill`, intended for arrays. Do not define both `skill` and `skills` in the same workflow or step. If included, it must contain at least one non-empty skill name.
 - `context` — `"fresh"` or `"fork"`.
 - `clarify` — boolean.
 - `async` — boolean.
@@ -132,6 +134,19 @@ Supported top-level execution fields:
 - `model` — single-task model override. Rejected unless `modelPolicy` is `"workflow"`.
 - `modelPolicy` — `"agent"` by default. Set `"workflow"` only if you intentionally want workflow-level model overrides.
 - `forkFallback` — `"fresh"` by default. If `context: "fork"` fails because Pi cannot create a forked subagent session, retry once with fresh context. Set `"error"` to fail instead.
+
+Step and task entries may also set `skill`/`skills`; step-level `skill: false` disables a top-level skill default for that task.
+
+Example skill-driven single-agent workflow:
+
+```jsonc
+{
+  "name": "access-risk",
+  "agent": "delegate",
+  "skills": ["behavior-risk-access-contracts"],
+  "task": "Run the injected behavior-risk skill for this scope:\n\n{{args}}"
+}
+```
 
 Supported template variables in task strings:
 
