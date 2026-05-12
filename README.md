@@ -42,9 +42,10 @@ examples/workflows/review-agents.jsonc
 examples/workflows/review-deep.jsonc
 examples/workflows/oracle-review.jsonc
 examples/agents/review-synthesizer.md
+examples/agents/skill-delegate.md
 ```
 
-Install all review examples globally:
+Install all examples globally:
 
 ```bash
 ./scripts/install-review-examples.sh
@@ -142,11 +143,13 @@ Example skill-driven single-agent workflow:
 ```jsonc
 {
   "name": "access-risk",
-  "agent": "delegate",
+  "agent": "skill-delegate",
   "skills": ["behavior-risk-access-contracts"],
   "task": "Run the injected behavior-risk skill for this scope:\n\n{{args}}"
 }
 ```
+
+The `examples/agents/skill-delegate.md` agent is intentionally generic: it does not inherit the full skills catalog, but it will follow any specific skills injected by a workflow-level or task-level `skill`/`skills` field.
 
 Supported template variables in task strings:
 
