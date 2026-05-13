@@ -190,6 +190,81 @@ test("model overrides are rejected by agent policy and forwarded by workflow pol
   assert.equal((chainedParams.chain?.[1] as any).parallel[0].model, "google/gemini-3-pro");
 });
 
+test("workflow defaultAgent is applied to tasks and chain steps", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-default-agent-"));
+  const tasksFile = join(dir, "tasks.jsonc");
+  writeFileSync(tasksFile, `{
+    "name": "default-agent-tasks",
+    "defaultAgent": "skill-delegate",
+    "tasks": [
+      { "task": "use default" },
+      { "agent": "custom-runner", "task": "override default" }
+    ]
+  }`);
+  const taskParams = buildSubagentParams(parseWorkflowFile(tasksFile)!, "", { args: "", positional: [] } as any, createCtx() as any);
+  assert.equal(taskParams.tasks?.[0].agent, "skill-delegate");
+  assert.equal(taskParams.tasks?.[1].agent, "custom-runner");
+
+  const chainFile = join(dir, "chain.jsonc");
+  writeFileSync(chainFile, `{
+    "name": "default-agent-chain",
+    "defaultAgent": "skill-delegate",
+    "chain": [
+      { "task": "first" },
+      { "parallel": [
+        { "task": "parallel default" },
+        { "agent": "custom-runner", "task": "parallel override" }
+      ] }
+    ]
+  }`);
+  const chainParams = buildSubagentParams(parseWorkflowFile(chainFile)!, "", { args: "", positional: [] } as any, createCtx() as any);
+  assert.equal((chainParams.chain?.[0] as any).agent, "skill-delegate");
+  assert.equal((chainParams.chain?.[1] as any).parallel[0].agent, "skill-delegate");
+  assert.equal((chainParams.chain?.[1] as any).parallel[1].agent, "custom-runner");
+});
+
+test("workflow items require agent when defaultAgent is absent", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-missing-agent-"));
+  const taskFile = join(dir, "missing-task-agent.jsonc");
+  writeFileSync(taskFile, `{ "name": "missing-task-agent", "tasks": [{ "task": "t" }] }`);
+  assert.throws(() => parseWorkflowFile(taskFile), /Workflow missing-task-agent\.tasks\[0\]\.agent must be a non-empty string or workflow\.defaultAgent must be set/);
+
+  const chainFile = join(dir, "missing-chain-agent.jsonc");
+  writeFileSync(chainFile, `{ "name": "missing-chain-agent", "chain": [{ "task": "t" }] }`);
+  assert.throws(() => parseWorkflowFile(chainFile), /Workflow missing-chain-agent\.chain\[0\]\.agent must be a non-empty string or workflow\.defaultAgent must be set/);
+
+  const parallelFile = join(dir, "missing-parallel-agent.jsonc");
+  writeFileSync(parallelFile, `{ "name": "missing-parallel-agent", "chain": [{ "parallel": [{ "task": "t" }] }] }`);
+  assert.throws(() => parseWorkflowFile(parallelFile), /Workflow missing-parallel-agent\.chain\[0\]\.parallel\[0\]\.agent must be a non-empty string or workflow\.defaultAgent must be set/);
+
+  const blankDefaultFile = join(dir, "blank-default.jsonc");
+  writeFileSync(blankDefaultFile, `{ "name": "blank-default", "defaultAgent": " ", "tasks": [{ "task": "t" }] }`);
+  assert.throws(() => parseWorkflowFile(blankDefaultFile), /Workflow blank-default\.defaultAgent must be a non-empty string/);
+
+  const blankAgentFile = join(dir, "blank-agent.jsonc");
+  writeFileSync(blankAgentFile, `{ "name": "blank-agent", "defaultAgent": "skill-delegate", "tasks": [{ "agent": " ", "task": "t" }] }`);
+  assert.throws(() => parseWorkflowFile(blankAgentFile), /Workflow blank-agent\.tasks\[0\]\.agent must be a non-empty string/);
+});
+
+test("workflow parsing rejects unknown keys", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-unknown-keys-"));
+  const rootFile = join(dir, "root.jsonc");
+  writeFileSync(rootFile, `{ "name": "unknown-root", "agent": "delegate", "task": "t", "unexpected": true }`);
+  assert.throws(() => parseWorkflowFile(rootFile), /Workflow .*root\.jsonc\.unexpected is not supported/);
+
+  const typoFile = join(dir, "typo.jsonc");
+  writeFileSync(typoFile, `{ "name": "agent-typo", "defaultAgent": "skill-delegate", "tasks": [{ "agnet": "specialist", "task": "t" }] }`);
+  assert.throws(() => parseWorkflowFile(typoFile), /Workflow agent-typo\.tasks\[0\]\.agnet is not supported/);
+
+  const chainFile = join(dir, "chain.jsonc");
+  writeFileSync(chainFile, `{ "name": "unknown-chain", "chain": [{ "agent": "delegate", "task": "t", "extra": true }] }`);
+  assert.throws(() => parseWorkflowFile(chainFile), /Workflow unknown-chain\.chain\[0\]\.extra is not supported/);
+
+  const parallelStepFile = join(dir, "parallel-step.jsonc");
+  writeFileSync(parallelStepFile, `{ "name": "unknown-parallel-step", "chain": [{ "parallel": [{ "agent": "delegate", "task": "t" }], "agent": "delegate" }] }`);
+  assert.throws(() => parseWorkflowFile(parallelStepFile), /Workflow unknown-parallel-step\.chain\[0\]\.agent is not supported/);
+});
+
 test("top-level skill aliases are parsed and forwarded", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-workflows-skills-"));
   const singleFile = join(dir, "single.jsonc");

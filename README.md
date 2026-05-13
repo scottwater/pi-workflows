@@ -123,6 +123,7 @@ Supported top-level execution fields:
 - `chain` — sequential chain with optional `{ "parallel": [...] }` steps.
 - `tasks` — top-level parallel task list.
 - `agent` + `task` — single subagent task.
+- `defaultAgent` — default agent for `chain` steps, nested parallel tasks, and top-level `tasks` entries that omit `agent`. Individual entries can still set `agent` to override it.
 - `skill` — non-empty skill name, comma-separated skill names, non-empty skill-name array, or `false`. For chains this is additive; for top-level parallel tasks it is applied to each task unless that task sets `skill: false`.
 - `skills` — alias for `skill`, intended for arrays. Do not define both `skill` and `skills` in the same workflow or step. If included, it must contain at least one non-empty skill name.
 - `context` — `"fresh"` or `"fork"`.
@@ -136,7 +137,7 @@ Supported top-level execution fields:
 - `modelPolicy` — `"agent"` by default. Set `"workflow"` only if you intentionally want workflow-level model overrides.
 - `forkFallback` — `"fresh"` by default. If `context: "fork"` fails because Pi cannot create a forked subagent session, retry once with fresh context. Set `"error"` to fail instead.
 
-Step and task entries may also set `skill`/`skills`; step-level `skill: false` disables a top-level skill default for that task.
+Step and task entries may also set `skill`/`skills`; step-level `skill: false` disables a top-level skill default for that task. Unknown workflow, step, or task fields are rejected so typos such as `agnet` do not silently fall back to defaults.
 
 Example skill-driven single-agent workflow:
 
@@ -150,6 +151,20 @@ Example skill-driven single-agent workflow:
 ```
 
 The `examples/agents/skill-delegate.md` agent is intentionally generic: it does not inherit the full skills catalog, but it will follow any specific skills injected by a workflow-level or task-level `skill`/`skills` field.
+
+For multi-step skill workflows, set `defaultAgent` once and override only the exceptional entries:
+
+```jsonc
+{
+  "name": "skill-sweep",
+  "defaultAgent": "skill-delegate",
+  "skills": ["behavior-risk-access-contracts"],
+  "tasks": [
+    { "task": "Review authentication changes: {{args}}" },
+    { "agent": "review-synthesizer", "task": "Summarize any risk findings for: {{args}}" }
+  ]
+}
+```
 
 Supported template variables in task strings:
 

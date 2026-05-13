@@ -47,6 +47,7 @@ type Workflow = {
   agentScope?: AgentScope;
   model?: string;
   skill?: SkillSpec;
+  defaultAgent?: string;
   chain?: ChainStep[];
   tasks?: ParallelTask[];
   agent?: string;
@@ -578,6 +579,14 @@ function describeField(path: string, field: string): string {
   return field ? `${path}.${field}` : path;
 }
 
+function assertKnownKeys(value: Record<string, unknown>, fieldPath: string, allowed: readonly string[]): void {
+  const allowedSet = new Set(allowed);
+  const unknown = Object.keys(value).find((key) => !allowedSet.has(key));
+  if (unknown) {
+    throw new Error(`${fieldPath}.${unknown} is not supported. Allowed fields: ${allowed.join(", ")}.`);
+  }
+}
+
 function assertString(value: unknown, fieldPath: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${fieldPath} must be a non-empty string.`);
   return value;
@@ -587,6 +596,11 @@ function assertOptionalString(value: unknown, fieldPath: string): string | undef
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Error(`${fieldPath} must be a string.`);
   return value;
+}
+
+function assertOptionalNonEmptyString(value: unknown, fieldPath: string): string | undefined {
+  if (value === undefined) return undefined;
+  return assertString(value, fieldPath).trim();
 }
 
 function assertOptionalBoolean(value: unknown, fieldPath: string): boolean | undefined {
@@ -651,10 +665,31 @@ function assertOptionalPositiveInteger(value: unknown, fieldPath: string): numbe
   return value as number;
 }
 
-function validateSequentialStep(value: unknown, fieldPath: string): SequentialStep {
+function stepAgent(value: Record<string, unknown>, fieldPath: string, defaultAgent: string | undefined): string {
+  const agent = assertOptionalNonEmptyString(value.agent, `${fieldPath}.agent`);
+  if (agent) return agent;
+  if (defaultAgent) return defaultAgent;
+  throw new Error(`${fieldPath}.agent must be a non-empty string or workflow.defaultAgent must be set.`);
+}
+
+const WORKFLOW_KEYS = [
+  "name", "description", "modelPolicy", "forkFallback", "context", "clarify", "async", "worktree",
+  "cwd", "chainDir", "agentScope", "model", "skill", "skills", "defaultAgent", "chain", "tasks", "agent", "task",
+] as const;
+const SEQUENTIAL_STEP_KEYS = ["agent", "task", "cwd", "output", "reads", "progress", "skill", "skills", "model"] as const;
+const PARALLEL_TASK_KEYS = [...SEQUENTIAL_STEP_KEYS, "count"] as const;
+const PARALLEL_STEP_KEYS = ["parallel", "concurrency", "failFast", "worktree"] as const;
+
+function validateSequentialStep(
+  value: unknown,
+  fieldPath: string,
+  defaultAgent?: string,
+  allowedKeys: readonly string[] = SEQUENTIAL_STEP_KEYS,
+): SequentialStep {
   if (!isRecord(value)) throw new Error(`${fieldPath} must be an object.`);
+  assertKnownKeys(value, fieldPath, allowedKeys);
   const step: SequentialStep = {
-    agent: assertString(value.agent, `${fieldPath}.agent`),
+    agent: stepAgent(value, fieldPath, defaultAgent),
     task: assertOptionalString(value.task, `${fieldPath}.task`),
     cwd: assertOptionalString(value.cwd, `${fieldPath}.cwd`),
     output: value.output === false ? false : assertOptionalString(value.output, `${fieldPath}.output`),
@@ -669,21 +704,22 @@ function validateSequentialStep(value: unknown, fieldPath: string): SequentialSt
   return step;
 }
 
-function validateParallelTask(value: unknown, fieldPath: string): ParallelTask {
-  const task = validateSequentialStep(value, fieldPath) as ParallelTask;
+function validateParallelTask(value: unknown, fieldPath: string, defaultAgent?: string): ParallelTask {
+  const task = validateSequentialStep(value, fieldPath, defaultAgent, PARALLEL_TASK_KEYS) as ParallelTask;
   if (!isRecord(value)) return task;
   task.count = assertOptionalPositiveInteger(value.count, `${fieldPath}.count`);
   if (task.count === undefined) delete task.count;
   return task;
 }
 
-function validateChainStep(value: unknown, fieldPath: string): ChainStep {
+function validateChainStep(value: unknown, fieldPath: string, defaultAgent?: string): ChainStep {
   if (!isRecord(value)) throw new Error(`${fieldPath} must be an object.`);
   if ("parallel" in value) {
+    assertKnownKeys(value, fieldPath, PARALLEL_STEP_KEYS);
     if (!Array.isArray(value.parallel)) throw new Error(`${fieldPath}.parallel must be an array.`);
     if (value.parallel.length === 0) throw new Error(`${fieldPath}.parallel must not be empty.`);
     const step: ParallelStep = {
-      parallel: value.parallel.map((task, index) => validateParallelTask(task, `${fieldPath}.parallel[${index}]`)),
+      parallel: value.parallel.map((task, index) => validateParallelTask(task, `${fieldPath}.parallel[${index}]`, defaultAgent)),
       concurrency: assertOptionalPositiveInteger(value.concurrency, `${fieldPath}.concurrency`),
       failFast: assertOptionalBoolean(value.failFast, `${fieldPath}.failFast`),
       worktree: assertOptionalBoolean(value.worktree, `${fieldPath}.worktree`),
@@ -693,29 +729,31 @@ function validateChainStep(value: unknown, fieldPath: string): ChainStep {
     }
     return step;
   }
-  return validateSequentialStep(value, fieldPath);
+  return validateSequentialStep(value, fieldPath, defaultAgent);
 }
 
 export function parseWorkflowFile(path: string): Workflow | undefined {
   const raw = readFileSync(path, "utf8");
   const parsed = JSON.parse(stripJsonComments(raw)) as unknown;
   if (!isRecord(parsed)) throw new Error(`Workflow ${path} must be a JSON object.`);
+  assertKnownKeys(parsed, `Workflow ${path}`, WORKFLOW_KEYS);
 
   const name = assertString(parsed.name, `Workflow ${path} name`).trim();
   const workflowPath = `Workflow ${name}`;
+  const defaultAgent = assertOptionalNonEmptyString(parsed.defaultAgent, `${workflowPath}.defaultAgent`);
   const chain = parsed.chain === undefined
     ? undefined
     : (() => {
       if (!Array.isArray(parsed.chain)) throw new Error(`${workflowPath}.chain must be an array.`);
       if (parsed.chain.length === 0) throw new Error(`${workflowPath}.chain must not be empty.`);
-      return parsed.chain.map((step, index) => validateChainStep(step, describeField(workflowPath, `chain[${index}]`)));
+      return parsed.chain.map((step, index) => validateChainStep(step, describeField(workflowPath, `chain[${index}]`), defaultAgent));
     })();
   const tasks = parsed.tasks === undefined
     ? undefined
     : (() => {
       if (!Array.isArray(parsed.tasks)) throw new Error(`${workflowPath}.tasks must be an array.`);
       if (parsed.tasks.length === 0) throw new Error(`${workflowPath}.tasks must not be empty.`);
-      return parsed.tasks.map((task, index) => validateParallelTask(task, describeField(workflowPath, `tasks[${index}]`)));
+      return parsed.tasks.map((task, index) => validateParallelTask(task, describeField(workflowPath, `tasks[${index}]`), defaultAgent));
     })();
   const agent = assertOptionalString(parsed.agent, `${workflowPath}.agent`);
   const task = assertOptionalString(parsed.task, `${workflowPath}.task`);
@@ -740,6 +778,7 @@ export function parseWorkflowFile(path: string): Workflow | undefined {
     agentScope: assertOptionalEnum(parsed.agentScope, `${workflowPath}.agentScope`, ["user", "project", "both"] as const),
     model: assertOptionalString(parsed.model, `${workflowPath}.model`),
     skill: normalizeSkillAlias(parsed, workflowPath),
+    defaultAgent,
     chain,
     tasks,
     agent,
