@@ -41,6 +41,7 @@ Example workflows and agents live under `examples/` only:
 examples/workflows/review-agents.jsonc
 examples/workflows/review-deep.jsonc
 examples/workflows/oracle-review.jsonc
+examples/workflows/quality-sweep.jsonc
 examples/agents/review-synthesizer.md
 examples/agents/skill-delegate.md
 ```
@@ -120,8 +121,8 @@ Workflows are JSON/JSONC files ending in `.json` or `.jsonc`.
 
 Supported top-level execution fields:
 
-- `chain` — sequential chain with optional `{ "parallel": [...] }` steps.
-- `tasks` — top-level parallel task list.
+- `chain` — sequential chain with optional `{ "parallel": [...] }` steps. Chain entries can be agent runnables or workflow runnables.
+- `tasks` — top-level parallel task list for agent runnables.
 - `agent` + `task` — single subagent task.
 - `defaultAgent` — default agent for `chain` steps, nested parallel tasks, and top-level `tasks` entries that omit `agent`. Individual entries can still set `agent` to override it.
 - `skill` — non-empty skill name, comma-separated skill names, non-empty skill-name array, or `false`. For chains this is additive; for top-level parallel tasks it is applied to each task unless that task sets `skill: false`.
@@ -138,6 +139,37 @@ Supported top-level execution fields:
 - `forkFallback` — `"fresh"` by default. If `context: "fork"` fails because Pi cannot create a forked subagent session, retry once with fresh context. Set `"error"` to fail instead.
 
 Step and task entries may also set `skill`/`skills`; step-level `skill: false` disables a top-level skill default for that task. Unknown workflow, step, or task fields are rejected so typos such as `agnet` do not silently fall back to defaults.
+
+Workflow runnables let a parent workflow run named workflows alongside normal agent steps. They use the existing workflow discovery precedence, and the parent workflow/runtime flags control the composed run. In v1, nested workflow runnables accept only `workflow` and optional `args`; they do not accept per-child `context`, `cwd`, `agentScope`, `clarify`, `async`, or `worktree` overrides. Only one nested workflow level is supported.
+
+Example mixed workflow composition:
+
+```jsonc
+{
+  "name": "quality-sweep",
+  "context": "fresh",
+  "chain": [
+    {
+      "parallel": [
+        { "workflow": "review-agents", "args": "{{args}}" },
+        { "workflow": "review-deep", "args": "{{args}}" },
+        {
+          "agent": "skill-delegate",
+          "skills": ["security-review"],
+          "task": "Run security review for:\n\n{{args}}"
+        }
+      ],
+      "failFast": false
+    },
+    {
+      "agent": "review-synthesizer",
+      "task": "Synthesize these review streams into one prioritized report:\n\n{{previous}}"
+    }
+  ]
+}
+```
+
+When a mixed parallel group uses `failFast: false`, failed child workflow/agent text is included in the aggregate so the synthesizer can still produce a useful report.
 
 Example skill-driven single-agent workflow:
 
@@ -171,7 +203,7 @@ Supported template variables in task strings:
 - `{{args}}` or `{{$@}}` — full slash-command args after runtime flags are removed.
 - `{{1}}`, `{{2}}`, ... — positional args with simple shell-style quoting.
 - `{{cwd}}` — invocation cwd.
-- `{{previous}}` — converted to `pi-subagents` `{previous}`.
+- `{{previous}}` — converted to `pi-subagents` `{previous}` in simple workflows, or replaced with the actual prior aggregate text in mixed workflow compositions.
 - `{{task}}` — converted to `{task}`.
 - `{{chain_dir}}` — converted to `{chain_dir}`.
 

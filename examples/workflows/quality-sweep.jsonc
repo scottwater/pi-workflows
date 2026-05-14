@@ -1,0 +1,32 @@
+{
+  "name": "quality-sweep",
+  "description": "Run included review workflows plus a delegated security review, then synthesize",
+  "modelPolicy": "agent",
+  "context": "fresh",
+  "clarify": false,
+  "agentScope": "both",
+  "chain": [
+    {
+      "parallel": [
+        {
+          "workflow": "review-agents",
+          "args": "{{args}}"
+        },
+        {
+          "workflow": "review-deep",
+          "args": "{{args}}"
+        },
+        {
+          "agent": "skill-delegate",
+          "skills": ["security-review"],
+          "task": "Run a focused security review for this scope. Do not edit files; report concrete risks only.\n\n{{args}}"
+        }
+      ],
+      "failFast": false
+    },
+    {
+      "agent": "review-synthesizer",
+      "task": "Synthesize these review workflows into one prioritized report. Include failed child workflow output as an explicit incomplete-review note instead of dropping it. Do not edit files; this is review-only.\n\nOriginal scope/request:\n{{args}}\n\nWorkflow outputs:\n{{previous}}\n\nDeduplicate overlapping findings, preserve file paths and concrete reasoning, and prioritize by severity/actionability."
+    }
+  ]
+}

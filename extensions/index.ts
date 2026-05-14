@@ -23,15 +23,21 @@ type SequentialStep = {
 };
 
 type ParallelTask = SequentialStep & { count?: number };
+type WorkflowRunnable = {
+  workflow: string;
+  args?: string;
+};
+type Runnable = SequentialStep | WorkflowRunnable;
+type ParallelRunnable = ParallelTask | WorkflowRunnable;
 
 type ParallelStep = {
-  parallel: ParallelTask[];
+  parallel: ParallelRunnable[];
   concurrency?: number;
   failFast?: boolean;
   worktree?: boolean;
 };
 
-type ChainStep = SequentialStep | ParallelStep;
+type ChainStep = Runnable | ParallelStep;
 
 type Workflow = {
   name: string;
@@ -81,6 +87,9 @@ type SubagentParamsLike = {
   cwd?: string;
   chainDir?: string;
   agentScope?: AgentScope;
+  output?: string | false;
+  reads?: string[] | false;
+  progress?: boolean;
 };
 
 type ProgressEntry = {
@@ -127,6 +136,8 @@ type AgentToolResult = {
     context?: ContextMode;
     progress?: ProgressEntry[];
     results?: AgentResultEntry[];
+    partialFailures?: AgentResultEntry[];
+    warnings?: string[];
     asyncId?: string;
     asyncDir?: string;
     artifacts?: { dir?: string };
@@ -678,6 +689,7 @@ const WORKFLOW_KEYS = [
 ] as const;
 const SEQUENTIAL_STEP_KEYS = ["agent", "task", "cwd", "output", "reads", "progress", "skill", "skills", "model"] as const;
 const PARALLEL_TASK_KEYS = [...SEQUENTIAL_STEP_KEYS, "count"] as const;
+const WORKFLOW_RUNNABLE_KEYS = ["workflow", "args"] as const;
 const PARALLEL_STEP_KEYS = ["parallel", "concurrency", "failFast", "worktree"] as const;
 
 function validateSequentialStep(
@@ -712,14 +724,37 @@ function validateParallelTask(value: unknown, fieldPath: string, defaultAgent?: 
   return task;
 }
 
+function validateWorkflowRunnable(value: Record<string, unknown>, fieldPath: string): WorkflowRunnable {
+  assertKnownKeys(value, fieldPath, WORKFLOW_RUNNABLE_KEYS);
+  const step: WorkflowRunnable = {
+    workflow: assertString(value.workflow, `${fieldPath}.workflow`).trim(),
+    args: assertOptionalString(value.args, `${fieldPath}.args`),
+  };
+  if (step.args === undefined) delete step.args;
+  return step;
+}
+
+function validateRunnable(value: unknown, fieldPath: string, defaultAgent?: string, allowCount = false): Runnable | ParallelRunnable {
+  if (!isRecord(value)) throw new Error(`${fieldPath} must be an object.`);
+  const hasWorkflow = value.workflow !== undefined;
+  const hasExplicitAgent = value.agent !== undefined;
+  if (hasWorkflow && hasExplicitAgent) throw new Error(`${fieldPath} must define either agent or workflow, not both.`);
+  if (hasWorkflow) return validateWorkflowRunnable(value, fieldPath);
+  return allowCount ? validateParallelTask(value, fieldPath, defaultAgent) : validateSequentialStep(value, fieldPath, defaultAgent);
+}
+
 function validateChainStep(value: unknown, fieldPath: string, defaultAgent?: string): ChainStep {
   if (!isRecord(value)) throw new Error(`${fieldPath} must be an object.`);
   if ("parallel" in value) {
     assertKnownKeys(value, fieldPath, PARALLEL_STEP_KEYS);
     if (!Array.isArray(value.parallel)) throw new Error(`${fieldPath}.parallel must be an array.`);
     if (value.parallel.length === 0) throw new Error(`${fieldPath}.parallel must not be empty.`);
+    const parallel = value.parallel.map((task, index) => validateRunnable(task, `${fieldPath}.parallel[${index}]`, defaultAgent, true) as ParallelRunnable);
+    if (value.worktree === true && parallel.some(isWorkflowRunnable)) {
+      throw new Error(`${fieldPath}.worktree is not supported when parallel includes workflow runnables.`);
+    }
     const step: ParallelStep = {
-      parallel: value.parallel.map((task, index) => validateParallelTask(task, `${fieldPath}.parallel[${index}]`, defaultAgent)),
+      parallel,
       concurrency: assertOptionalPositiveInteger(value.concurrency, `${fieldPath}.concurrency`),
       failFast: assertOptionalBoolean(value.failFast, `${fieldPath}.failFast`),
       worktree: assertOptionalBoolean(value.worktree, `${fieldPath}.worktree`),
@@ -729,7 +764,7 @@ function validateChainStep(value: unknown, fieldPath: string, defaultAgent?: str
     }
     return step;
   }
-  return validateSequentialStep(value, fieldPath, defaultAgent);
+  return validateRunnable(value, fieldPath, defaultAgent) as Runnable;
 }
 
 export function parseWorkflowFile(path: string): Workflow | undefined {
@@ -961,6 +996,26 @@ function renderTemplate(value: string, rawArgs: string, ctx: ExtensionCommandCon
   });
 }
 
+function renderCompositeTemplate(
+  value: string,
+  rawArgs: string,
+  ctx: ExtensionCommandContext,
+  positional = splitArgs(rawArgs),
+  previous = "",
+  task = rawArgs,
+): string {
+  return value.replace(/{{\s*([^}]+?)\s*}}/g, (_match, rawKey: string) => {
+    const key = rawKey.trim();
+    if (key === "args" || key === "$@") return rawArgs;
+    if (key === "cwd") return ctx.cwd;
+    if (key === "previous") return previous;
+    if (key === "task") return task;
+    if (key === "chain_dir" || key === "chainDir") return "{chain_dir}";
+    if (/^\d+$/.test(key)) return positional[Number(key) - 1] ?? "";
+    return _match;
+  });
+}
+
 function renderMaybeString<T>(value: T, rawArgs: string, ctx: ExtensionCommandContext, positional?: string[]): T {
   return typeof value === "string" ? (renderTemplate(value, rawArgs, ctx, positional) as T) : value;
 }
@@ -994,23 +1049,38 @@ function applyTaskSkillDefault(task: ParallelTask, skill: SkillSpec | undefined)
   return merged === undefined ? task : { ...task, skill: merged };
 }
 
+function isWorkflowRunnable(step: unknown): step is WorkflowRunnable {
+  return isRecord(step) && typeof step.workflow === "string";
+}
+
 function isParallelStep(step: ChainStep): step is ParallelStep {
   return "parallel" in step && Array.isArray((step as ParallelStep).parallel);
+}
+
+function renderWorkflowRunnable(step: WorkflowRunnable, rawArgs: string, ctx: ExtensionCommandContext, positional?: string[]): WorkflowRunnable {
+  return {
+    ...step,
+    args: step.args ? renderTemplate(step.args, rawArgs, ctx, positional) : undefined,
+  };
+}
+
+function renderRunnable(step: Runnable | ParallelRunnable, rawArgs: string, ctx: ExtensionCommandContext, positional?: string[]): Runnable | ParallelRunnable {
+  return isWorkflowRunnable(step) ? renderWorkflowRunnable(step, rawArgs, ctx, positional) : renderSequentialStep(step, rawArgs, ctx, positional);
 }
 
 function renderChainStep(step: ChainStep, rawArgs: string, ctx: ExtensionCommandContext, positional?: string[]): ChainStep {
   if (isParallelStep(step)) {
     return {
       ...step,
-      parallel: step.parallel.map((task) => renderSequentialStep(task, rawArgs, ctx, positional) as ParallelTask),
+      parallel: step.parallel.map((task) => renderRunnable(task, rawArgs, ctx, positional) as ParallelRunnable),
     };
   }
-  return renderSequentialStep(step, rawArgs, ctx, positional);
+  return renderRunnable(step, rawArgs, ctx, positional) as Runnable;
 }
 
 function hasModelOverrideInStep(step: ChainStep): boolean {
-  if (isParallelStep(step)) return step.parallel.some((task) => Boolean(task.model));
-  return Boolean(step.model);
+  if (isParallelStep(step)) return step.parallel.some((task) => !isWorkflowRunnable(task) && Boolean(task.model));
+  return !isWorkflowRunnable(step) && Boolean(step.model);
 }
 
 function assertModelPolicy(workflow: Workflow): void {
@@ -1023,7 +1093,17 @@ function assertModelPolicy(workflow: Workflow): void {
   }
 }
 
+function stepContainsNestedWorkflow(step: ChainStep): boolean {
+  if (isParallelStep(step)) return step.parallel.some(isWorkflowRunnable);
+  return isWorkflowRunnable(step);
+}
+
+function workflowContainsNestedWorkflow(workflow: Workflow): boolean {
+  return workflow.chain?.some(stepContainsNestedWorkflow) ?? false;
+}
+
 export function buildSubagentParams(workflow: Workflow, rawArgs: string, flags: RuntimeFlags, ctx: ExtensionCommandContext): SubagentParamsLike {
+  if (workflowContainsNestedWorkflow(workflow)) throw new Error(`Workflow ${workflow.name} contains nested workflow steps and cannot use the simple subagent fast path.`);
   assertModelPolicy(workflow);
   const positional = flags.positional ?? splitArgs(rawArgs);
   const params: SubagentParamsLike = {
@@ -1837,12 +1917,651 @@ export async function requestSubagentRun(
   });
 }
 
+type WorkflowRunResult = {
+  ok: boolean;
+  text: string;
+  errorText?: string;
+  details: AgentToolResult;
+  requestId?: string;
+  params?: SubagentParamsLike;
+  retriedFromFork?: boolean;
+  recoveredCompletionGuard?: boolean;
+};
+
+type CompositeExecutionOptions = {
+  flags: RuntimeFlags;
+  depth: number;
+  stack: string[];
+  forkFallback: ForkFallback;
+};
+
 function isForkCreationFailure(response: SlashSubagentResponse): boolean {
   const text = `${response.errorText ?? ""}\n${extractErrorText(response)}`;
   return /Failed to create forked subagent session|Forked subagent context requires/i.test(text);
 }
 
+function responseToWorkflowRunResult(workflow: Workflow, response: SlashSubagentResponse, retriedFromFork = false, allowCompletionGuardRecovery = true): WorkflowRunResult {
+  const recoveredCompletionGuard = allowCompletionGuardRecovery && shouldRecoverCompletionGuardFailure(workflow, response);
+  const ok = !response.isError || recoveredCompletionGuard;
+  const text = formatResponseText(response, retriedFromFork, recoveredCompletionGuard);
+  const errorText = response.isError ? extractErrorText(response) : undefined;
+  return {
+    ok,
+    text,
+    errorText,
+    details: response.result,
+    requestId: response.requestId,
+    retriedFromFork,
+    recoveredCompletionGuard,
+  };
+}
+
+type SubagentRunWithForkFallbackResult = {
+  requestId: string;
+  params: SubagentParamsLike;
+  response: SlashSubagentResponse;
+  retriedFromFork: boolean;
+};
+
+function ensureForkDispatchPersistence(
+  ctx: ExtensionCommandContext,
+  workflowName: string,
+  requestId: string,
+  params: SubagentParamsLike,
+): void {
+  if (!ctx.hasUI || params.context !== "fork") return;
+  persistWorkflowSessionOnly(ctx, {
+    workflowName,
+    requestId,
+    operation: "fork-dispatch",
+    requirePersistence: true,
+    throwOnPersistenceFailure: true,
+  });
+}
+
+function notifyForkFallbackRetry(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workflow: Workflow,
+  requestId: string,
+  params: SubagentParamsLike,
+  sourcePath?: string,
+): void {
+  if (ctx.hasUI) {
+    try {
+      ctx.ui.notify?.(`Workflow /${workflow.name}: forked context was unavailable; retrying with fresh context.`, "warning");
+    } catch {
+      // Preserve the workflow failure/fallback path; UI notification failures are secondary.
+    }
+  }
+  try {
+    if (supportsWorkflowWidgetSurface(ctx)) setWorkflowProgressWidget(ctx, workflow.name, requestId, { requestId, status: "starting", progress: [] });
+    sendWorkflowProgressMessage(pi, ctx, {
+      customType: WORKFLOW_PROGRESS_MESSAGE_TYPE,
+      content: `↻ Workflow /${workflow.name}: forked context unavailable; retrying with fresh context...`,
+      display: true,
+      details: { workflow: workflow.name, sourcePath: sourcePath ?? workflow.sourcePath, requestId, params: snapshotParams(params), retry: "fresh", status: "starting", progress: [] },
+    }, {
+      workflowName: workflow.name,
+      requestId,
+      operation: "retry-fresh",
+    });
+  } catch (error) {
+    logWorkflowDiagnostic(`Workflow /${workflow.name} failed to report fork fallback retry.`, error);
+  }
+}
+
+async function requestSubagentRunWithForkFallback(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workflow: Workflow,
+  initialParams: SubagentParamsLike,
+  options: { forkFallback?: ForkFallback; sourcePath?: string } = {},
+): Promise<SubagentRunWithForkFallbackResult> {
+  let requestId = randomUUID();
+  let params = { ...initialParams };
+  const forkFallback = options.forkFallback ?? workflow.forkFallback ?? "fresh";
+  setWorkflowLiveState({
+    workflow: workflow.name,
+    requestId,
+    status: "starting",
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    progress: [],
+  });
+  ensureForkDispatchPersistence(ctx, workflow.name, requestId, params);
+  let response = await requestSubagentRun(pi, ctx, requestId, params, workflow.name);
+  let retriedFromFork = false;
+  if (
+    response.isError &&
+    params.context === "fork" &&
+    forkFallback !== "error" &&
+    isForkCreationFailure(response)
+  ) {
+    retriedFromFork = true;
+    const forkFailureState = workflowLiveStates.get(requestId);
+    if (forkFailureState) {
+      setWorkflowLiveState({
+        ...forkFailureState,
+        status: "failed",
+        updatedAt: Date.now(),
+        progress: response.result.details?.progress ?? forkFailureState.progress,
+      });
+    }
+    requestId = randomUUID();
+    params = { ...params, context: "fresh" };
+    notifyForkFallbackRetry(pi, ctx, workflow, requestId, params, options.sourcePath);
+    setWorkflowLiveState({
+      workflow: workflow.name,
+      requestId,
+      status: "starting",
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      progress: [],
+    });
+    response = await requestSubagentRun(pi, ctx, requestId, params, workflow.name);
+  }
+  return { requestId, params, response, retriedFromFork };
+}
+
+function selectedCompositeContext(workflow: Workflow, flags: RuntimeFlags): ContextMode {
+  return flags.context ?? workflow.context ?? "fresh";
+}
+
+function selectedCompositeForkFallback(workflow: Workflow): ForkFallback {
+  return workflow.forkFallback ?? "fresh";
+}
+
+function selectedCompositeCwd(workflow: Workflow, rawArgs: string, flags: RuntimeFlags, ctx: ExtensionCommandContext): string | undefined {
+  const positional = flags.positional ?? splitArgs(rawArgs);
+  return flags.cwd ?? renderMaybeString(workflow.cwd, rawArgs, ctx, positional);
+}
+
+function selectedCompositeAgentScope(workflow: Workflow, flags: RuntimeFlags): AgentScope | undefined {
+  return flags.agentScope ?? workflow.agentScope;
+}
+
+function selectedCompositeClarify(workflow: Workflow, flags: RuntimeFlags): boolean | undefined {
+  return flags.clarify ?? workflow.clarify;
+}
+
+function childFlagsForArgs(parentWorkflow: Workflow, parentArgs: string, parentFlags: RuntimeFlags, ctx: ExtensionCommandContext, childArgs: string): RuntimeFlags {
+  return {
+    args: childArgs,
+    positional: splitArgs(childArgs),
+    context: selectedCompositeContext(parentWorkflow, parentFlags),
+    clarify: selectedCompositeClarify(parentWorkflow, parentFlags),
+    cwd: selectedCompositeCwd(parentWorkflow, parentArgs, parentFlags, ctx),
+    chainDir: parentFlags.chainDir ?? renderMaybeString(parentWorkflow.chainDir, parentArgs, ctx, parentFlags.positional),
+    agentScope: selectedCompositeAgentScope(parentWorkflow, parentFlags),
+  };
+}
+
+function compositeRunParams(workflow: Workflow, rawArgs: string, flags: RuntimeFlags, ctx: ExtensionCommandContext): SubagentParamsLike {
+  return {
+    task: rawArgs,
+    context: selectedCompositeContext(workflow, flags),
+    clarify: selectedCompositeClarify(workflow, flags) ?? false,
+    cwd: selectedCompositeCwd(workflow, rawArgs, flags, ctx),
+    chainDir: flags.chainDir ?? renderMaybeString(workflow.chainDir, rawArgs, ctx, flags.positional),
+    agentScope: selectedCompositeAgentScope(workflow, flags) ?? "both",
+  };
+}
+
+async function executeSimpleWorkflowForResult(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workflow: Workflow,
+  rawArgs: string,
+  flags: RuntimeFlags,
+  options?: Pick<CompositeExecutionOptions, "forkFallback">,
+): Promise<WorkflowRunResult> {
+  const run = await requestSubagentRunWithForkFallback(
+    pi,
+    ctx,
+    workflow,
+    buildSubagentParams(workflow, rawArgs, flags, ctx),
+    { forkFallback: options?.forkFallback, sourcePath: workflow.sourcePath },
+  );
+  const result = responseToWorkflowRunResult(workflow, run.response, run.retriedFromFork);
+  result.params = run.params;
+  return result;
+}
+
+function resultEntryFromRun(label: string, result: WorkflowRunResult): AgentResultEntry {
+  return {
+    agent: label,
+    finalOutput: result.text,
+    error: result.ok ? undefined : result.errorText ?? result.text,
+    exitCode: result.ok ? 0 : 1,
+  };
+}
+
+function mergeAgentToolResults(
+  text: string,
+  results: AgentResultEntry[],
+  ok: boolean,
+  partialFailures: AgentResultEntry[] = [],
+  warnings: string[] = [],
+): AgentToolResult {
+  return {
+    content: [{ type: "text", text }],
+    isError: !ok || partialFailures.length > 0,
+    details: {
+      mode: "composite",
+      results,
+      ...(partialFailures.length > 0 ? { partialFailures } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+    },
+  };
+}
+
+function skippedWorkflowRunResult(reason: string): WorkflowRunResult {
+  return {
+    ok: false,
+    text: reason,
+    errorText: reason,
+    details: mergeAgentToolResults(reason, [], false, [], [reason]),
+  };
+}
+
+function runnableLabel(runnable: Runnable | ParallelRunnable): string {
+  return isWorkflowRunnable(runnable) ? `Workflow: ${runnable.workflow}` : `Agent: ${runnable.agent}`;
+}
+
+function aggregateRunnableResults(results: Array<{ runnable: Runnable | ParallelRunnable; result: WorkflowRunResult; label?: string }>): string {
+  return results
+    .map(({ runnable, result, label }) => {
+      const status = result.ok ? "ok" : "failed";
+      return `=== ${label ?? runnableLabel(runnable)} (${status}) ===\n${result.text}`;
+    })
+    .join("\n\n");
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  failFast: boolean,
+  run: (item: T, index: number) => Promise<WorkflowRunResult>,
+): Promise<Array<WorkflowRunResult | undefined>> {
+  const results: Array<WorkflowRunResult | undefined> = new Array(items.length);
+  let nextIndex = 0;
+  let stopped = false;
+  const worker = async () => {
+    while (!stopped && nextIndex < items.length) {
+      const index = nextIndex++;
+      const result = await run(items[index]!, index);
+      results[index] = result;
+      if (failFast && !result.ok) stopped = true;
+    }
+  };
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+function renderRunnableTask(step: SequentialStep, rawArgs: string, ctx: ExtensionCommandContext, positional: string[], previous: string, index: number): string {
+  if (step.task !== undefined) return renderCompositeTemplate(step.task, rawArgs, ctx, positional, previous, rawArgs);
+  return index === 0 ? rawArgs : previous;
+}
+
+type ExpandedParallelRunnable = {
+  runnable: ParallelRunnable;
+  label: string;
+};
+
+function expandParallelRunnables(runnables: ParallelRunnable[]): ExpandedParallelRunnable[] {
+  return runnables.flatMap((runnable) => {
+    const count = isWorkflowRunnable(runnable) ? 1 : runnable.count ?? 1;
+    return Array.from({ length: count }, (_unused, instanceIndex) => ({
+      runnable,
+      label: count > 1 ? `${runnableLabel(runnable)} #${instanceIndex + 1}/${count}` : runnableLabel(runnable),
+    }));
+  });
+}
+
+async function executeAgentRunnableForResult(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  parentWorkflow: Workflow,
+  step: SequentialStep,
+  rawArgs: string,
+  flags: RuntimeFlags,
+  previous: string,
+  index: number,
+  options: CompositeExecutionOptions,
+  executionOptions: { worktree?: boolean } = {},
+): Promise<WorkflowRunResult> {
+  const positional = flags.positional ?? splitArgs(rawArgs);
+  const effectiveStep = applyTaskSkillDefault(step as ParallelTask, parentWorkflow.skill) as ParallelTask;
+  const params: SubagentParamsLike = {
+    agent: effectiveStep.agent,
+    task: renderRunnableTask(effectiveStep, rawArgs, ctx, positional, previous, index),
+    model: effectiveStep.model,
+    skill: effectiveStep.skill,
+    context: selectedCompositeContext(parentWorkflow, flags),
+    clarify: selectedCompositeClarify(parentWorkflow, flags) ?? false,
+    cwd: renderMaybeString(effectiveStep.cwd, rawArgs, ctx, positional) ?? selectedCompositeCwd(parentWorkflow, rawArgs, flags, ctx),
+    chainDir: flags.chainDir ?? renderMaybeString(parentWorkflow.chainDir, rawArgs, ctx, positional),
+    agentScope: selectedCompositeAgentScope(parentWorkflow, flags) ?? "both",
+    worktree: executionOptions.worktree,
+  };
+  if (effectiveStep.output !== undefined) params.output = effectiveStep.output;
+  if (effectiveStep.reads !== undefined) params.reads = effectiveStep.reads;
+  if (effectiveStep.progress !== undefined) params.progress = effectiveStep.progress;
+  for (const key of Object.keys(params) as Array<keyof SubagentParamsLike>) {
+    if (params[key] === undefined) delete params[key];
+  }
+  const run = await requestSubagentRunWithForkFallback(pi, ctx, parentWorkflow, params, { forkFallback: options.forkFallback, sourcePath: parentWorkflow.sourcePath });
+  const result = responseToWorkflowRunResult(parentWorkflow, run.response, run.retriedFromFork, false);
+  result.params = run.params;
+  return result;
+}
+
+function workflowScopesForAgentScope(agentScope: AgentScope | undefined): WorkflowScope[] {
+  switch (agentScope ?? "both") {
+    case "user":
+      return ["user"];
+    case "project":
+      return ["project"];
+    case "both":
+      return ["user", "project"];
+  }
+}
+
+function lookupWorkflow(cwd: string, name: string, agentScope: AgentScope | undefined): Workflow {
+  const warnings: WorkflowLoadWarning[] = [];
+  const workflows = loadWorkflows(cwd, warnings, true, workflowScopesForAgentScope(agentScope));
+  const workflow = workflows.find((candidate) => candidate.name === name);
+  if (!workflow) {
+    const scopeText = agentScope ?? "both";
+    const warningText = warnings.length ? ` Skipped workflow warnings: ${warnings.map((warning) => `${warning.path}: ${warning.error}`).join("; ")}` : "";
+    throw new Error(`Nested workflow not found in ${scopeText} scope: ${name}.${warningText}`);
+  }
+  return workflow;
+}
+
+async function executeWorkflowRunnableForResult(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  parentWorkflow: Workflow,
+  step: WorkflowRunnable,
+  rawArgs: string,
+  flags: RuntimeFlags,
+  previous: string,
+  options: CompositeExecutionOptions,
+): Promise<WorkflowRunResult> {
+  const positional = flags.positional ?? splitArgs(rawArgs);
+  const childArgs = renderCompositeTemplate(step.args ?? "{{args}}", rawArgs, ctx, positional, previous, rawArgs);
+  const cwd = selectedCompositeCwd(parentWorkflow, rawArgs, flags, ctx) ?? ctx.cwd;
+  const child = lookupWorkflow(cwd, step.workflow, selectedCompositeAgentScope(parentWorkflow, flags) ?? "both");
+  return executeWorkflowForResult(pi, ctx, child, childArgs, childFlagsForArgs(parentWorkflow, rawArgs, flags, ctx, childArgs), {
+    ...options,
+    depth: options.depth + 1,
+    stack: [...options.stack, parentWorkflow.name],
+  });
+}
+
+async function executeRunnableForResult(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  parentWorkflow: Workflow,
+  step: Runnable | ParallelRunnable,
+  rawArgs: string,
+  flags: RuntimeFlags,
+  previous: string,
+  index: number,
+  options: CompositeExecutionOptions,
+  executionOptions: { worktree?: boolean } = {},
+): Promise<WorkflowRunResult> {
+  return isWorkflowRunnable(step)
+    ? executeWorkflowRunnableForResult(pi, ctx, parentWorkflow, step, rawArgs, flags, previous, options)
+    : executeAgentRunnableForResult(pi, ctx, parentWorkflow, step, rawArgs, flags, previous, index, options, executionOptions);
+}
+
+async function executeParallelStepForResult(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workflow: Workflow,
+  step: ParallelStep,
+  rawArgs: string,
+  flags: RuntimeFlags,
+  previous: string,
+  index: number,
+  options: CompositeExecutionOptions,
+): Promise<WorkflowRunResult> {
+  const expanded = expandParallelRunnables(step.parallel);
+  const concurrency = step.concurrency ?? expanded.length;
+  const failFast = step.failFast !== false;
+  const results = await runWithConcurrency(expanded, concurrency, failFast, (entry) =>
+    executeRunnableForResult(pi, ctx, workflow, entry.runnable, rawArgs, flags, previous, index, options, { worktree: step.worktree }),
+  );
+  const paired = expanded
+    .map((entry, resultIndex) => {
+      const result = results[resultIndex] ?? (failFast
+        ? skippedWorkflowRunResult(`Skipped because failFast stopped parallel step ${index + 1} before this runnable started.`)
+        : undefined);
+      return result ? { runnable: entry.runnable, label: entry.label, result } : undefined;
+    })
+    .filter((entry): entry is { runnable: ParallelRunnable; label: string; result: WorkflowRunResult } => Boolean(entry));
+  const entries = paired.map(({ label, result }) => resultEntryFromRun(label, result));
+  const partialFailures = entries.filter(resultEntryFailed);
+  const failed = paired.find(({ result }) => !result.ok && !result.details.details?.warnings?.some((warning) => /Skipped because failFast/.test(warning)));
+  const aggregate = aggregateRunnableResults(paired);
+  const skippedCount = paired.filter(({ result }) => result.details.details?.warnings?.some((warning) => /Skipped because failFast/.test(warning))).length;
+  const warnings = [
+    skippedCount > 0 ? `Parallel step ${index + 1} skipped ${skippedCount} child runnable${skippedCount === 1 ? "" : "s"} because failFast stopped scheduling.` : undefined,
+    partialFailures.length > 0 && !(failed && failFast) ? `Parallel step ${index + 1} completed with ${partialFailures.length} failed child runnable${partialFailures.length === 1 ? "" : "s"}.` : undefined,
+  ].filter((warning): warning is string => Boolean(warning));
+  if (failed && failFast) {
+    return { ok: false, text: failed.result.errorText ?? failed.result.text, errorText: failed.result.errorText ?? failed.result.text, details: mergeAgentToolResults(aggregate, entries, false, partialFailures, warnings) };
+  }
+  return { ok: true, text: aggregate, details: mergeAgentToolResults(aggregate, entries, true, partialFailures, warnings) };
+}
+
+async function executeCompositeWorkflowForResult(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workflow: Workflow,
+  rawArgs: string,
+  flags: RuntimeFlags,
+  options: CompositeExecutionOptions,
+): Promise<WorkflowRunResult> {
+  assertModelPolicy(workflow);
+  if (options.stack.includes(workflow.name)) {
+    throw new Error(`Workflow composition recursion detected: ${[...options.stack, workflow.name].join(" -> ")}`);
+  }
+  if (options.depth > 0 && workflowContainsNestedWorkflow(workflow)) {
+    throw new Error(`Nested workflow /${workflow.name} contains workflow steps; pi-workflows v1 supports only one nested workflow level.`);
+  }
+  if (!workflow.chain) throw new Error(`Composite workflow /${workflow.name} must define a chain.`);
+  const childOptions = { ...options, stack: [...options.stack, workflow.name] };
+  const entries: AgentResultEntry[] = [];
+  const partialFailures: AgentResultEntry[] = [];
+  const warnings: string[] = [];
+  let previous = "";
+  for (const [index, step] of workflow.chain.entries()) {
+    const result = isParallelStep(step)
+      ? await executeParallelStepForResult(pi, ctx, workflow, step, rawArgs, flags, previous, index, childOptions)
+      : await executeRunnableForResult(pi, ctx, workflow, step, rawArgs, flags, previous, index, childOptions);
+    entries.push(...(result.details.details?.results ?? [resultEntryFromRun(isParallelStep(step) ? `Parallel step ${index + 1}` : runnableLabel(step), result)]));
+    partialFailures.push(...(result.details.details?.partialFailures ?? []));
+    warnings.push(...(result.details.details?.warnings ?? []));
+    if (!result.ok) return { ok: false, text: result.text, errorText: result.errorText ?? result.text, details: mergeAgentToolResults(result.text, entries, false, partialFailures, warnings) };
+    previous = result.text;
+  }
+  return { ok: true, text: previous || "(workflow completed with no text output)", details: mergeAgentToolResults(previous, entries, true, partialFailures, warnings) };
+}
+
+async function executeWorkflowForResult(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  workflow: Workflow,
+  rawArgs: string,
+  flags: RuntimeFlags,
+  options: CompositeExecutionOptions,
+): Promise<WorkflowRunResult> {
+  if (options.stack.includes(workflow.name)) {
+    throw new Error(`Workflow composition recursion detected: ${[...options.stack, workflow.name].join(" -> ")}`);
+  }
+  if (options.depth > 0 && workflow.async === true) {
+    throw new Error(`Nested workflow /${workflow.name} sets async/background execution, which is not supported in workflow composition v1.`);
+  }
+  if (options.depth > 0 && workflow.worktree === true) {
+    throw new Error(`Nested workflow /${workflow.name} sets worktree execution, which is not supported in workflow composition v1.`);
+  }
+  return workflowContainsNestedWorkflow(workflow)
+    ? executeCompositeWorkflowForResult(pi, ctx, workflow, rawArgs, flags, options)
+    : executeSimpleWorkflowForResult(pi, ctx, workflow, rawArgs, flags, options);
+}
+
+async function runCompositeWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext, workflow: Workflow, args: string): Promise<void> {
+  const flags = extractRuntimeFlags(args);
+  const requestId = randomUUID();
+  const params = compositeRunParams(workflow, flags.args, flags, ctx);
+  let responseFailure: Error | undefined;
+  if (ctx.hasUI) ctx.ui.notify(`Running workflow /${workflow.name}`, "info");
+  try {
+    if (flags.async || workflow.async) throw new Error(`Composite workflow /${workflow.name} does not support background/async execution in v1.`);
+    if (flags.worktree || workflow.worktree) throw new Error(`Composite workflow /${workflow.name} does not support worktree execution when composing workflows in v1.`);
+    setWorkflowLiveState({ workflow: workflow.name, requestId, status: "starting", startedAt: Date.now(), updatedAt: Date.now(), progress: [] });
+    const useWorkflowWidget = supportsWorkflowWidgetSurface(ctx);
+    const requireForkPersistence = ctx.hasUI && params.context === "fork";
+    if (useWorkflowWidget) setWorkflowProgressWidget(ctx, workflow.name, requestId, { requestId, status: "starting", progress: [] });
+    sendWorkflowProgressMessage(pi, ctx, {
+      customType: WORKFLOW_PROGRESS_MESSAGE_TYPE,
+      content: `▶ Running workflow /${workflow.name}...`,
+      display: true,
+      details: { workflow: workflow.name, sourcePath: workflow.sourcePath, requestId, params: snapshotParams(params), status: "starting", progress: [] },
+    }, {
+      workflowName: workflow.name,
+      requestId,
+      operation: "start",
+      persistHiddenMessage: useWorkflowWidget && requireForkPersistence,
+      requirePersistence: requireForkPersistence,
+      throwOnPersistenceFailure: requireForkPersistence,
+    });
+    const result = await executeCompositeWorkflowForResult(pi, ctx, workflow, flags.args, flags, { flags, depth: 0, stack: [], forkFallback: selectedCompositeForkFallback(workflow) });
+    const effectiveIsError = !result.ok || result.details.isError === true;
+    let resultPersistenceFailure: WorkflowPersistenceError | undefined;
+    let resultReportingFailure: Error | undefined;
+    try {
+      const existingState = workflowLiveStates.get(requestId);
+      if (existingState) setWorkflowLiveState({ ...existingState, status: effectiveIsError ? "failed" : "completed", updatedAt: Date.now() });
+      const persistence = sendWorkflowMessage(pi, ctx, {
+        customType: WORKFLOW_RESULT_MESSAGE_TYPE,
+        content: result.text,
+        display: true,
+        details: {
+          workflow: workflow.name,
+          sourcePath: workflow.sourcePath,
+          requestId,
+          params: snapshotParams(params),
+          isError: effectiveIsError,
+          errorText: result.errorText,
+          result: result.details,
+        },
+      }, {
+        workflowName: workflow.name,
+        requestId,
+        operation: "result",
+      });
+      if (isPersistenceFailure(persistence)) {
+        resultPersistenceFailure = persistence.error;
+        notifyWorkflowPersistenceFailure(ctx, persistence.error);
+      }
+    } catch (error) {
+      if (error instanceof WorkflowPersistenceError) {
+        resultPersistenceFailure = error;
+        notifyWorkflowPersistenceFailure(ctx, error);
+      } else {
+        resultReportingFailure = toError(error, "final composite workflow result reporting failed");
+        logWorkflowDiagnostic(`Workflow /${workflow.name} failed to report final composite result.`, resultReportingFailure);
+      }
+      if (!effectiveIsError && resultReportingFailure) throw resultReportingFailure;
+    }
+    if (!result.ok) {
+      const workflowError = new Error(`Workflow /${workflow.name} failed: ${result.errorText ?? result.text}`);
+      const secondaryFailures = [resultReportingFailure, resultPersistenceFailure].filter((failure): failure is Error => Boolean(failure));
+      responseFailure = secondaryFailures.length > 0
+        ? new AggregateError(
+          [workflowError, ...secondaryFailures],
+          `Workflow /${workflow.name} failed and failed to report final result: ${result.errorText ?? result.text}`,
+        )
+        : workflowError;
+      if (ctx.hasUI) {
+        try {
+          ctx.ui.notify?.(result.errorText ?? "Workflow failed", "error");
+        } catch {
+          // Preserve the workflow failure; UI notification failures are secondary.
+        }
+      }
+    } else if (ctx.hasUI && !resultPersistenceFailure) {
+      try {
+        ctx.ui.notify?.(
+          effectiveIsError ? `Workflow /${workflow.name} completed with partial failures` : `Workflow /${workflow.name} completed`,
+          effectiveIsError ? "warning" : "info",
+        );
+      } catch {
+        // Successful workflow result reporting already completed; notification is best-effort.
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    let reportingPersistenceFailure: WorkflowPersistenceError | undefined;
+    let reportingFailure: Error | undefined;
+    try {
+      const existingState = workflowLiveStates.get(requestId);
+      if (existingState) setWorkflowLiveState({ ...existingState, status: "failed", updatedAt: Date.now() });
+      const persistence = sendWorkflowMessage(pi, ctx, {
+        customType: WORKFLOW_RESULT_MESSAGE_TYPE,
+        content: `Workflow /${workflow.name} failed: ${message}`,
+        display: true,
+        details: { workflow: workflow.name, sourcePath: workflow.sourcePath, requestId, params: snapshotParams(params), isError: true, error: message },
+      }, {
+        workflowName: workflow.name,
+        requestId,
+        operation: "error-result",
+      });
+      if (isPersistenceFailure(persistence)) {
+        reportingPersistenceFailure = persistence.error;
+        notifyWorkflowPersistenceFailure(ctx, persistence.error);
+      }
+    } catch (reportingError) {
+      if (reportingError instanceof WorkflowPersistenceError) {
+        reportingPersistenceFailure = reportingError;
+        notifyWorkflowPersistenceFailure(ctx, reportingError);
+      } else {
+        reportingFailure = toError(reportingError, "composite workflow error result reporting failed");
+        logWorkflowDiagnostic(`Workflow /${workflow.name} failed to report composite error result.`, reportingFailure);
+      }
+    }
+    if (ctx.hasUI) {
+      try {
+        ctx.ui.notify?.(message, "error");
+      } catch {
+        // Preserve the original workflow failure; UI notification failures are secondary.
+      }
+    }
+    if (reportingPersistenceFailure || reportingFailure) {
+      throw new AggregateError(
+        [error, reportingFailure, reportingPersistenceFailure].filter((failure): failure is Error => Boolean(failure)),
+        `Workflow /${workflow.name} failed and failed to report error result: ${message}`,
+      );
+    }
+    throw error;
+  } finally {
+    if (ctx.hasUI) ctx.ui.setStatus?.("pi-workflows", undefined);
+    if (supportsWorkflowWidgetSurface(ctx)) ctx.ui.setWidget?.("pi-workflows", undefined);
+  }
+  if (responseFailure) throw responseFailure;
+}
+
 export async function runWorkflow(pi: ExtensionAPI, ctx: ExtensionCommandContext, workflow: Workflow, args: string): Promise<void> {
+  if (workflowContainsNestedWorkflow(workflow)) {
+    await runCompositeWorkflow(pi, ctx, workflow, args);
+    return;
+  }
   const flags = extractRuntimeFlags(args);
   let requestId = randomUUID();
   let params: SubagentParamsLike | undefined;
