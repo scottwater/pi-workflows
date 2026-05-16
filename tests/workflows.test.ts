@@ -9,6 +9,8 @@ import registerPiWorkflows, {
   parseWorkflowFile,
   requestSubagentRun,
   runWorkflow,
+  splitArgs,
+  stripJsonComments,
 } from "../extensions/index.ts";
 
 const REQUEST_EVENT = "subagent:slash:request";
@@ -16,13 +18,13 @@ const STARTED_EVENT = "subagent:slash:started";
 const RESPONSE_EVENT = "subagent:slash:response";
 const CANCEL_EVENT = "subagent:slash:cancel";
 
+type Listener = (data: unknown) => void;
+
 const testTheme = {
   fg: (_name: string, text: string) => text,
   bg: (_name: string, text: string) => text,
   bold: (text: string) => text,
 };
-
-type Listener = (data: unknown) => void;
 
 function withTempHome<T>(fn: (home: string) => T): T {
   const previousHome = process.env.HOME;
@@ -64,19 +66,70 @@ function createEvents() {
   };
 }
 
-function createCtx(cwd = process.cwd()) {
+function createCtx(cwd = process.cwd(), hasUI = false) {
   return {
     cwd,
-    hasUI: false,
+    hasUI,
     ui: {
-      notify() {},
+      notifications: [] as Array<{ message: string; level?: string }>,
+      notify(message: string, level?: string) {
+        this.notifications.push({ message, level });
+      },
       setStatus() {},
-      setWidget() {},
+      setWidget(_id: string, content?: unknown) {
+        if (content !== undefined && !Array.isArray(content) && typeof content !== "function") {
+          throw new TypeError("content is not a function");
+        }
+      },
     },
   };
 }
 
-test("slash bridge waits for asynchronous started and response events", async () => {
+function createPi() {
+  const events = createEvents();
+  const messages: any[] = [];
+  const commands = new Map<string, any>();
+  const renderers = new Map<string, any>();
+  return {
+    events,
+    messages,
+    commands,
+    renderers,
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+    registerCommand(name: string, command: any) {
+      commands.set(name, command);
+    },
+    registerMessageRenderer(type: string, renderer: any) {
+      renderers.set(type, renderer);
+    },
+    on() {},
+  };
+}
+
+function respondToRequests(pi: ReturnType<typeof createPi>, handler: (params: any) => { text?: string; isError?: boolean; errorText?: string; result?: any }) {
+  pi.events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string; params: any };
+    const response = handler(request.params);
+    setTimeout(() => {
+      pi.events.emit(STARTED_EVENT, { requestId: request.requestId });
+      pi.events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: response.isError === true,
+        errorText: response.errorText,
+        result: response.result ?? { content: [{ type: "text", text: response.text ?? "ok" }] },
+      });
+    }, 0);
+  });
+}
+
+function writeWorkflow(dir: string, name: string, content: string) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${name}.jsonc`), content);
+}
+
+test("slash bridge waits for matching asynchronous started and response events", async () => {
   const events = createEvents();
   const pi = { events };
 
@@ -84,17 +137,9 @@ test("slash bridge waits for asynchronous started and response events", async ()
     const request = data as { requestId: string };
     setTimeout(() => {
       events.emit(STARTED_EVENT, { requestId: "unrelated" });
-      events.emit(RESPONSE_EVENT, {
-        requestId: "unrelated",
-        isError: false,
-        result: { content: [{ type: "text", text: "wrong" }] },
-      });
+      events.emit(RESPONSE_EVENT, { requestId: "unrelated", isError: false, result: { content: [{ type: "text", text: "wrong" }] } });
       events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "ok" }] },
-      });
+      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false, result: { content: [{ type: "text", text: "ok" }] } });
     }, 0);
   });
 
@@ -104,33 +149,24 @@ test("slash bridge waits for asynchronous started and response events", async ()
   assert.equal(response.result.content?.[0]?.text, "ok");
 });
 
-test("slash bridge rejects and requests cancellation when pi-subagents never starts", async () => {
+test("slash bridge rejects and cancels when pi-subagents never starts", async () => {
   const events = createEvents();
   const pi = { events };
   const cancellations: any[] = [];
-
   events.on(CANCEL_EVENT, (data) => cancellations.push(data));
 
   await assert.rejects(
-    requestSubagentRun(
-      pi as any,
-      createCtx() as any,
-      "req-no-start",
-      { agent: "a", task: "t" },
-      "timeout-wf",
-      { startMs: 10, responseMs: 50 },
-    ),
-    /Workflow \/timeout-wf request req-no-start: pi-subagents did not respond/,
+    requestSubagentRun(pi as any, createCtx() as any, "req-no-start", { agent: "a", task: "t" }, "timeout-wf", { startMs: 10, responseMs: 50 }),
+    /pi-subagents did not respond/,
   );
   assert.equal(cancellations.length, 1);
   assert.equal(cancellations[0].requestId, "req-no-start");
 });
 
-test("slash bridge rejects and requests cancellation when started run never sends terminal response", async () => {
+test("slash bridge rejects and cancels when a started run never finishes", async () => {
   const events = createEvents();
   const pi = { events };
   const cancellations: any[] = [];
-
   events.on(CANCEL_EVENT, (data) => cancellations.push(data));
   events.on(REQUEST_EVENT, (data) => {
     const request = data as { requestId: string };
@@ -138,2328 +174,596 @@ test("slash bridge rejects and requests cancellation when started run never send
   });
 
   await assert.rejects(
-    requestSubagentRun(
-      pi as any,
-      createCtx() as any,
-      "req-timeout",
-      { agent: "a", task: "t" },
-      "timeout-wf",
-      { startMs: 50, responseMs: 10 },
-    ),
-    /Workflow \/timeout-wf request req-timeout: pi-subagents started but did not send a terminal response/,
+    requestSubagentRun(pi as any, createCtx() as any, "req-timeout", { agent: "a", task: "t" }, "timeout-wf", { startMs: 50, responseMs: 10 }),
+    /started but did not send a terminal response/,
   );
   assert.equal(cancellations.length, 1);
-  assert.equal(cancellations[0].requestId, "req-timeout");
 });
 
-test("model overrides are rejected by agent policy and forwarded by workflow policy", () => {
-  const workflow = {
-    name: "model-test",
-    sourcePath: "model-test.jsonc",
-    modelPolicy: "workflow",
-    agent: "reviewer",
-    model: "anthropic/claude-opus-4-5",
-    task: "Review {{args}}",
-  };
+test("JSONC parsing preserves strings and handles comments after trailing commas", () => {
+  const raw = `{
+    // comment
+    "name": "jsonc",
+    "agent": "reviewer",
+    "task": "Keep // and /* markers */ inside strings", // trailing note
+  }`;
+  const parsed = JSON.parse(stripJsonComments(raw));
+  assert.equal(parsed.task, "Keep // and /* markers */ inside strings");
 
-  const params = buildSubagentParams(workflow as any, "the diff", { args: "", positional: ["the", "diff"] } as any, createCtx() as any);
-  assert.equal(params.agent, "reviewer");
-  assert.equal(params.model, "anthropic/claude-opus-4-5");
-  assert.equal(params.task, "Review the diff");
-
-  assert.throws(
-    () => buildSubagentParams({ ...workflow, modelPolicy: "agent" } as any, "the diff", { args: "", positional: ["the", "diff"] } as any, createCtx() as any),
-    /modelPolicy=agent.*model override/,
-  );
-
-  const chained = {
-    name: "nested-model-test",
-    sourcePath: "nested-model-test.jsonc",
-    modelPolicy: "agent",
-    chain: [
-      { agent: "first", task: "one", model: "anthropic/claude-opus-4-5" },
-      { parallel: [{ agent: "second", task: "two", model: "google/gemini-3-pro" }] },
-    ],
-  };
-  assert.throws(
-    () => buildSubagentParams(chained as any, "", { args: "", positional: [] } as any, createCtx() as any),
-    /modelPolicy=agent.*model override/,
-  );
-  const chainedParams = buildSubagentParams({ ...chained, modelPolicy: "workflow" } as any, "", { args: "", positional: [] } as any, createCtx() as any);
-  assert.equal((chainedParams.chain?.[0] as any).model, "anthropic/claude-opus-4-5");
-  assert.equal((chainedParams.chain?.[1] as any).parallel[0].model, "google/gemini-3-pro");
-});
-
-test("workflow defaultAgent is applied to tasks and chain steps", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-default-agent-"));
-  const tasksFile = join(dir, "tasks.jsonc");
-  writeFileSync(tasksFile, `{
-    "name": "default-agent-tasks",
-    "defaultAgent": "skill-delegate",
+  const blockComment = `{
+    "name": "jsonc-block",
     "tasks": [
-      { "task": "use default" },
-      { "agent": "custom-runner", "task": "override default" }
-    ]
-  }`);
-  const taskParams = buildSubagentParams(parseWorkflowFile(tasksFile)!, "", { args: "", positional: [] } as any, createCtx() as any);
-  assert.equal(taskParams.tasks?.[0].agent, "skill-delegate");
-  assert.equal(taskParams.tasks?.[1].agent, "custom-runner");
-
-  const chainFile = join(dir, "chain.jsonc");
-  writeFileSync(chainFile, `{
-    "name": "default-agent-chain",
-    "defaultAgent": "skill-delegate",
-    "chain": [
-      { "task": "first" },
-      { "parallel": [
-        { "task": "parallel default" },
-        { "agent": "custom-runner", "task": "parallel override" }
-      ] }
-    ]
-  }`);
-  const chainParams = buildSubagentParams(parseWorkflowFile(chainFile)!, "", { args: "", positional: [] } as any, createCtx() as any);
-  assert.equal((chainParams.chain?.[0] as any).agent, "skill-delegate");
-  assert.equal((chainParams.chain?.[1] as any).parallel[0].agent, "skill-delegate");
-  assert.equal((chainParams.chain?.[1] as any).parallel[1].agent, "custom-runner");
+      { "agent": "a", "task": "t" }, /* trailing note */
+    ],
+  }`;
+  const parsedBlock = JSON.parse(stripJsonComments(blockComment));
+  assert.equal(parsedBlock.tasks.length, 1);
 });
 
-test("workflow items require agent when defaultAgent is absent", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-missing-agent-"));
-  const taskFile = join(dir, "missing-task-agent.jsonc");
-  writeFileSync(taskFile, `{ "name": "missing-task-agent", "tasks": [{ "task": "t" }] }`);
-  assert.throws(() => parseWorkflowFile(taskFile), /Workflow missing-task-agent\.tasks\[0\]\.agent must be a non-empty string or workflow\.defaultAgent must be set/);
+test("workflow schema allows model overrides and rejects removed fields", () => withTempHome(() => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-schema-"));
+  const valid = join(dir, "valid.jsonc");
+  writeFileSync(valid, `{ "name": "model-ok", "agent": "reviewer", "model": "anthropic/claude-sonnet-4", "task": "Review {{args}}" }`);
+  assert.equal(parseWorkflowFile(valid)?.model, "anthropic/claude-sonnet-4");
 
-  const chainFile = join(dir, "missing-chain-agent.jsonc");
-  writeFileSync(chainFile, `{ "name": "missing-chain-agent", "chain": [{ "task": "t" }] }`);
-  assert.throws(() => parseWorkflowFile(chainFile), /Workflow missing-chain-agent\.chain\[0\]\.agent must be a non-empty string or workflow\.defaultAgent must be set/);
-
-  const parallelFile = join(dir, "missing-parallel-agent.jsonc");
-  writeFileSync(parallelFile, `{ "name": "missing-parallel-agent", "chain": [{ "parallel": [{ "task": "t" }] }] }`);
-  assert.throws(() => parseWorkflowFile(parallelFile), /Workflow missing-parallel-agent\.chain\[0\]\.parallel\[0\]\.agent must be a non-empty string or workflow\.defaultAgent must be set/);
-
-  const blankDefaultFile = join(dir, "blank-default.jsonc");
-  writeFileSync(blankDefaultFile, `{ "name": "blank-default", "defaultAgent": " ", "tasks": [{ "task": "t" }] }`);
-  assert.throws(() => parseWorkflowFile(blankDefaultFile), /Workflow blank-default\.defaultAgent must be a non-empty string/);
-
-  const blankAgentFile = join(dir, "blank-agent.jsonc");
-  writeFileSync(blankAgentFile, `{ "name": "blank-agent", "defaultAgent": "skill-delegate", "tasks": [{ "agent": " ", "task": "t" }] }`);
-  assert.throws(() => parseWorkflowFile(blankAgentFile), /Workflow blank-agent\.tasks\[0\]\.agent must be a non-empty string/);
-});
-
-test("workflow parsing rejects unknown keys", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-unknown-keys-"));
-  const rootFile = join(dir, "root.jsonc");
-  writeFileSync(rootFile, `{ "name": "unknown-root", "agent": "delegate", "task": "t", "unexpected": true }`);
-  assert.throws(() => parseWorkflowFile(rootFile), /Workflow .*root\.jsonc\.unexpected is not supported/);
-
-  const typoFile = join(dir, "typo.jsonc");
-  writeFileSync(typoFile, `{ "name": "agent-typo", "defaultAgent": "skill-delegate", "tasks": [{ "agnet": "specialist", "task": "t" }] }`);
-  assert.throws(() => parseWorkflowFile(typoFile), /Workflow agent-typo\.tasks\[0\]\.agnet is not supported/);
-
-  const chainFile = join(dir, "chain.jsonc");
-  writeFileSync(chainFile, `{ "name": "unknown-chain", "chain": [{ "agent": "delegate", "task": "t", "extra": true }] }`);
-  assert.throws(() => parseWorkflowFile(chainFile), /Workflow unknown-chain\.chain\[0\]\.extra is not supported/);
-
-  const parallelStepFile = join(dir, "parallel-step.jsonc");
-  writeFileSync(parallelStepFile, `{ "name": "unknown-parallel-step", "chain": [{ "parallel": [{ "agent": "delegate", "task": "t" }], "agent": "delegate" }] }`);
-  assert.throws(() => parseWorkflowFile(parallelStepFile), /Workflow unknown-parallel-step\.chain\[0\]\.agent is not supported/);
-});
-
-test("workflow runnables are parsed with strict validation", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-composition-parse-"));
-  const goodFile = join(dir, "good.jsonc");
-  writeFileSync(goodFile, `{
-    "name": "composite-parse",
-    "chain": [
-      { "workflow": "review-agents", "args": "{{args}}" },
-      { "parallel": [
-        { "workflow": "keystone" },
-        { "agent": "delegate", "task": "Review {{args}}" }
-      ] }
-    ]
-  }`);
-  const workflow = parseWorkflowFile(goodFile)!;
-  assert.equal((workflow.chain?.[0] as any).workflow, "review-agents");
-  assert.equal((workflow.chain?.[1] as any).parallel[0].workflow, "keystone");
-  assert.throws(
-    () => buildSubagentParams(workflow, "scope", { args: "scope", positional: ["scope"] } as any, createCtx() as any),
-    /nested workflow steps.*simple subagent fast path/,
-  );
-
-  const bothFile = join(dir, "both.jsonc");
-  writeFileSync(bothFile, `{ "name": "both", "chain": [{ "agent": "delegate", "workflow": "review-agents", "task": "t" }] }`);
-  assert.throws(() => parseWorkflowFile(bothFile), /must define either agent or workflow, not both/);
-
-  const overrideFile = join(dir, "override.jsonc");
-  writeFileSync(overrideFile, `{ "name": "override", "chain": [{ "workflow": "review-agents", "context": "fresh" }] }`);
-  assert.throws(() => parseWorkflowFile(overrideFile), /Workflow override\.chain\[0\]\.context is not supported/);
-
-  const worktreeFile = join(dir, "worktree.jsonc");
-  writeFileSync(worktreeFile, `{ "name": "worktree", "chain": [{ "parallel": [{ "workflow": "review-agents" }], "worktree": true }] }`);
-  assert.throws(() => parseWorkflowFile(worktreeFile), /worktree is not supported when parallel includes workflow runnables/);
-});
-
-test("composite workflows mix nested workflows and agents before synthesis", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-run-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "child-review.jsonc"), `{ "name": "child-review", "agent": "child-agent", "task": "child task {{args}}" }`);
-  const events = createEvents();
-  const messages: any[] = [];
-  const requests: any[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string; task?: string } };
-    requests.push(request.params);
-    const text = request.params.agent === "synth"
-      ? `synth output:\n${request.params.task}`
-      : `${request.params.agent} output:\n${request.params.task}`;
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false, result: { content: [{ type: "text", text }] } });
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    createCtx(cwd) as any,
-    {
-      name: "quality-sweep",
-      sourcePath: "quality-sweep.jsonc",
-      context: "fresh",
-      chain: [
-        { parallel: [
-          { workflow: "child-review", args: "child {{args}}" },
-          { agent: "security", task: "security task {{args}}" },
-        ], failFast: false },
-        { agent: "synth", task: "Synthesize:\n{{previous}}" },
-      ],
-    } as any,
-    "scope",
-  );
-
-  assert.equal(requests.at(-1).agent, "synth");
-  assert.match(requests.at(-1).task, /=== Workflow: child-review \(ok\) ===/);
-  assert.match(requests.at(-1).task, /child-agent output:\nchild task child scope/);
-  assert.match(requests.at(-1).task, /=== Agent: security \(ok\) ===/);
-  const result = messages.findLast((message) => message.customType === "pi-workflows-result");
-  assert.match(result.content, /synth output:/);
-});
-
-test("nested workflow lookup honors selected agentScope", async () => withTempHome(async (home) => {
-  const globalDir = join(home, ".pi", "agent", "workflows");
-  mkdirSync(globalDir, { recursive: true });
-  writeFileSync(join(globalDir, "shared-child.jsonc"), `{ "name": "shared-child", "agent": "user-agent", "task": "user {{args}}" }`);
-  writeFileSync(join(globalDir, "user-only-child.jsonc"), `{ "name": "user-only-child", "agent": "user-only-agent", "task": "user only" }`);
-
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-nested-scope-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "shared-child.jsonc"), `{ "name": "shared-child", "agent": "project-agent", "task": "project {{args}}" }`);
-
-  const events = createEvents();
-  const requests: any[] = [];
-  const pi = { events, sendMessage() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string; task?: string } };
-    requests.push(request.params);
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: `${request.params.agent} ok` }] },
-      });
-    }, 0);
-  });
-
-  const parent = {
-    name: "parent",
-    sourcePath: "parent.jsonc",
-    chain: [{ workflow: "shared-child" }],
-  } as any;
-
-  await runWorkflow(pi as any, createCtx(cwd) as any, parent, "--agent-scope=user scope");
-  assert.equal(requests.at(-1).agent, "user-agent");
-
-  await runWorkflow(pi as any, createCtx(cwd) as any, parent, "--agent-scope=project scope");
-  assert.equal(requests.at(-1).agent, "project-agent");
-
-  await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, {
-      name: "project-only-parent",
-      sourcePath: "project-only-parent.jsonc",
-      chain: [{ workflow: "user-only-child" }],
-    } as any, "--agent-scope=project scope"),
-    /Nested workflow not found in project scope: user-only-child/,
-  );
+  for (const [file, body, pattern] of [
+    ["policy.jsonc", `{ "name": "bad", "modelPolicy": "agent", "agent": "a", "task": "t" }`, /modelPolicy is not supported/],
+    ["context.jsonc", `{ "name": "bad", "context": "fork", "agent": "a", "task": "t" }`, /context is not supported/],
+    ["async.jsonc", `{ "name": "bad", "async": true, "agent": "a", "task": "t" }`, /async is not supported/],
+    ["step-output.jsonc", `{ "name": "bad", "chain": [{ "agent": "a", "task": "t", "output": "x" }] }`, /output is not supported/],
+    ["count.jsonc", `{ "name": "bad", "chain": [{ "parallel": [{ "agent": "a", "task": "t", "count": 2 }] }] }`, /count is not supported/],
+    ["worktree.jsonc", `{ "name": "bad", "chain": [{ "parallel": [{ "agent": "a", "task": "t" }], "worktree": true }] }`, /worktree is not supported/],
+  ] as const) {
+    const path = join(dir, file);
+    writeFileSync(path, body);
+    assert.throws(() => parseWorkflowFile(path), pattern);
+  }
 }));
 
-test("parallel workflow lookup errors propagate instead of becoming partial child results", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-parallel-lookup-error-"));
+test("workflow defaultAgent, skills, model, and failFast are parsed into subagent params", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-params-"));
+  const file = join(dir, "wf.jsonc");
+  writeFileSync(file, `{
+    "name": "params",
+    "defaultAgent": "skill-delegate",
+    "skills": ["security-review"],
+    "chain": [
+      { "task": "first {{1}} {{args}}", "model": "m1" },
+      { "parallel": [
+        { "task": "parallel", "model": "m2" },
+        { "agent": "custom", "task": "custom", "skills": ["docs"] }
+      ], "failFast": false }
+    ]
+  }`);
+  const params = buildSubagentParams(parseWorkflowFile(file)!, '"two words" rest', { args: '"two words" rest', positional: ["two words", "rest"] }, createCtx() as any);
+  assert.deepEqual(params.skill, ["security-review"]);
+  assert.equal((params.chain?.[0] as any).agent, "skill-delegate");
+  assert.equal((params.chain?.[0] as any).model, "m1");
+  assert.equal((params.chain?.[0] as any).task, 'first two words "two words" rest');
+  assert.equal((params.chain?.[1] as any).failFast, false);
+  assert.equal((params.chain?.[1] as any).parallel[0].model, "m2");
+  assert.equal((params.chain?.[1] as any).parallel[1].agent, "custom");
+  for (const removed of ["context", "worktree", "cwd", "chainDir", "agentScope", "clarify", "async", "output", "reads", "progress"]) {
+    assert.equal((params as any)[removed], undefined);
+  }
+});
+
+test("top-level tasks receive workflow skill defaults without unsupported params", () => {
+  const workflow = {
+    name: "tasks",
+    sourcePath: "tasks.jsonc",
+    skill: ["security"],
+    tasks: [
+      { agent: "a", task: "A {{args}}" },
+      { agent: "b", task: "B", skill: false },
+    ],
+  };
+  const params = buildSubagentParams(workflow as any, "scope", { args: "scope", positional: ["scope"] }, createCtx() as any);
+  assert.deepEqual(params.tasks?.[0].skill, ["security"]);
+  assert.equal(params.tasks?.[1].skill, false);
+  assert.equal(params.tasks?.[0].task, "A scope");
+  assert.equal((params as any).agentScope, undefined);
+});
+
+test("nested workflow runnables are kept for the composite runner, not emitted to pi-subagents", () => {
+  const workflow = { name: "parent", sourcePath: "parent.jsonc", chain: [{ workflow: "child" }] } as any;
+  assert.throws(
+    () => buildSubagentParams(workflow, "scope", { args: "scope", positional: ["scope"] }, createCtx() as any),
+    /nested workflow steps/,
+  );
+});
+
+test("malformed pi-subagents responses fail instead of becoming successful workflows", async () => {
   const events = createEvents();
-  const requests: any[] = [];
-  const pi = { events, sendMessage() {} };
+  const pi = { events };
   events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string } };
-    requests.push(request.params);
+    const request = data as { requestId: string };
     setTimeout(() => {
       events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false, result: { content: [{ type: "text", text: "ok" }] } });
+      events.emit(RESPONSE_EVENT, {
+        requestId: request.requestId,
+        isError: "true",
+        result: { content: [{ type: "text", text: "bad" }] },
+      });
     }, 0);
   });
 
   await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, {
-      name: "parent",
-      sourcePath: "parent.jsonc",
-      chain: [
-        { parallel: [{ workflow: "missing-child" }, { agent: "security", task: "security" }], failFast: false },
-        { agent: "synth", task: "{{previous}}" },
-      ],
-    } as any, "scope"),
-    /Nested workflow not found in both scope: missing-child/,
+    requestSubagentRun(pi as any, createCtx() as any, "bad-response", { agent: "a", task: "t" }, "wf"),
+    /isError must be a boolean/,
   );
-
-  assert.equal(requests.some((request) => request.agent === "synth"), false);
 });
 
-test("composite parallel failFast false passes failed child output to synthesizer", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-failure-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "child-review.jsonc"), `{ "name": "child-review", "agent": "child-agent", "task": "child {{args}}" }`);
-  const events = createEvents();
-  const requests: any[] = [];
-  const messages: any[] = [];
-  const pi = { events, sendMessage: (message: any) => messages.push(message) };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string; task?: string } };
-    requests.push(request.params);
-    const isChild = request.params.agent === "child-agent";
-    const text = isChild ? "child failed loudly" : `${request.params.agent} saw:\n${request.params.task}`;
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: isChild, errorText: isChild ? text : undefined, result: { content: [{ type: "text", text }] } });
-    }, 0);
-  });
+test("successful workflow output prefers final agent output over summary content", async () => withTempHome(async () => {
+  const pi = createPi();
+  respondToRequests(pi, () => ({
+    result: {
+      content: [{ type: "text", text: "Parallel: 2/2 succeeded" }],
+      details: { results: [{ agent: "synth", exitCode: 0, finalOutput: "## Real review\n\nFinding details." }] },
+    },
+  }));
 
-  await runWorkflow(pi as any, createCtx(cwd) as any, {
-    name: "quality-sweep",
-    sourcePath: "quality-sweep.jsonc",
-    chain: [
-      { parallel: [{ workflow: "child-review" }, { agent: "security", task: "security" }], failFast: false },
-      { agent: "synth", task: "{{previous}}" },
-    ],
-  } as any, "scope");
+  await runWorkflow(pi as any, createCtx() as any, { name: "review", sourcePath: "review.jsonc", agent: "synth", task: "t" } as any, "scope");
+  const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
+  assert.match(result.content, /## Real review/);
+  assert.doesNotMatch(result.content, /Parallel: 2\/2 succeeded/);
+}));
 
-  assert.equal(requests.at(-1).agent, "synth");
-  assert.match(requests.at(-1).task, /Workflow: child-review \(failed\)/);
-  assert.match(requests.at(-1).task, /child failed loudly/);
-  const result = messages.findLast((message) => message.customType === "pi-workflows-result");
+test("simple subagent partialFailures make the workflow fail", async () => withTempHome(async () => {
+  const pi = createPi();
+  respondToRequests(pi, () => ({
+    result: {
+      content: [{ type: "text", text: "summary says done" }],
+      details: { partialFailures: [{ agent: "worker", exitCode: 1, error: "worker failed" }] },
+    },
+  }));
+
+  await assert.rejects(
+    runWorkflow(pi as any, createCtx() as any, { name: "partial", sourcePath: "partial.jsonc", agent: "a", task: "t" } as any, "scope"),
+    /worker failed/,
+  );
+  const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
   assert.equal(result.details.isError, true);
-  assert.equal(result.details.result.isError, true);
-  assert.equal(result.details.result.details.partialFailures.length, 1);
+  assert.match(result.content, /worker failed/);
+}));
+
+test("agent-only chains without failFast false use native subagent chain fast path", async () => withTempHome(async () => {
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    return { text: "chain ok" };
+  });
+
+  await runWorkflow(pi as any, createCtx() as any, {
+    name: "native-chain",
+    sourcePath: "native-chain.jsonc",
+    chain: [
+      { agent: "first", task: "first {{args}}" },
+      { agent: "second", task: "second {{previous}}" },
+    ],
+  } as any, "scope");
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].agent, undefined);
+  assert.equal(requests[0].chain.length, 2);
+  assert.equal(requests[0].chain[0].agent, "first");
+}));
+
+test("runWorkflow keeps runtime-looking flags as normal args", async () => {
+  const pi = createPi();
+  const requests: any[] = [];
+  pi.events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string; params: any };
+    requests.push(request.params);
+    setTimeout(() => {
+      pi.events.emit(STARTED_EVENT, { requestId: request.requestId });
+      pi.events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false, result: { content: [{ type: "text", text: "ok" }] } });
+    }, 0);
+  });
+
+  await runWorkflow(pi as any, createCtx() as any, {
+    name: "flags",
+    sourcePath: "flags.jsonc",
+    agent: "a",
+    task: "one={{1}} two={{2}} args={{args}}",
+  } as any, '"two words" --fork next --clarify');
+
+  assert.equal(requests[0].task, 'one=two words two=--fork args="two words" --fork next --clarify');
+  assert.equal(requests[0].context, undefined);
+  assert.equal(requests[0].clarify, undefined);
 });
 
-test("composite inline agents honor fork fallback", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-fork-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "child.jsonc"), `{ "name": "child", "agent": "child-agent", "task": "child {{args}}" }`);
-  const events = createEvents();
-  const requests: any[] = [];
-  const pi = { events, sendMessage() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string; context?: string } };
-    requests.push(request.params);
-    const failFork = request.params.agent === "inline" && request.params.context === "fork" && requests.filter((entry) => entry.agent === "inline").length === 1;
+test("UI workflow widgets use Pi-supported component factories", async () => withTempHome(async () => {
+  const pi = createPi();
+  const widgetPayloads: unknown[] = [];
+  pi.events.on(REQUEST_EVENT, (data) => {
+    const request = data as { requestId: string; params: any };
     setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
+      pi.events.emit(STARTED_EVENT, { requestId: request.requestId });
+      pi.events.emit("subagent:slash:update", {
         requestId: request.requestId,
-        isError: failFork,
-        errorText: failFork ? "Failed to create forked subagent session" : undefined,
-        result: { content: [{ type: "text", text: failFork ? "fork failed" : `${request.params.agent} ok` }] },
+        progress: [{ agent: request.params.agent, status: "running", currentTool: "grep", toolCount: 2 }],
+        currentTool: "grep",
+        toolCount: 2,
       });
+      pi.events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false, result: { content: [{ type: "text", text: "ok" }] } });
     }, 0);
+  });
+  const ctx = createCtx(process.cwd(), true) as any;
+  ctx.ui.setWidget = (_id: string, content?: unknown) => {
+    if (content !== undefined && !Array.isArray(content) && typeof content !== "function") {
+      throw new TypeError("content is not a function");
+    }
+    widgetPayloads.push(content);
+  };
+
+  await runWorkflow(pi as any, ctx, { name: "ui", sourcePath: "ui.jsonc", agent: "a", task: "t" } as any, "scope");
+  const renderedWidgets = widgetPayloads
+    .filter((payload): payload is Function => typeof payload === "function")
+    .map((factory) => factory(null, testTheme).render(120).join("\n"));
+  assert.ok(renderedWidgets.some((rendered) => /workflow \/ui \| starting/.test(rendered)));
+  assert.ok(renderedWidgets.some((rendered) => /a: running \(2 tools\)/.test(rendered) && /grep/.test(rendered)));
+  assert.equal(widgetPayloads.at(-1), undefined);
+}));
+
+test("UI side-effect failures do not mask workflow success", async () => withTempHome(async () => {
+  const previousConsoleError = console.error;
+  console.error = () => {};
+  try {
+    const pi = createPi();
+    respondToRequests(pi, () => ({ text: "ok" }));
+    const ctx = createCtx(process.cwd(), true) as any;
+    ctx.ui.notify = () => { throw new Error("notify failed"); };
+    ctx.ui.setStatus = () => { throw new Error("status failed"); };
+    ctx.ui.setWidget = () => { throw new Error("widget failed"); };
+
+    await runWorkflow(pi as any, ctx, { name: "ui-side-effects", sourcePath: "ui.jsonc", agent: "a", task: "t" } as any, "scope");
+    const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
+    assert.equal(result.details.isError, false);
+    assert.match(result.content, /ok/);
+  } finally {
+    console.error = previousConsoleError;
+  }
+}));
+
+test("plain chain failFast false continues to synthesis after a parallel child failure", async () => withTempHome(async () => {
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    if (params.agent === "b") return { isError: true, errorText: "b websocket closed", text: "b websocket closed" };
+    if (params.agent === "synth") return { text: `synth saw:\n${params.task}` };
+    return { text: `${params.agent} output` };
+  });
+
+  await runWorkflow(pi as any, createCtx() as any, {
+    name: "review-agents",
+    sourcePath: "review-agents.jsonc",
+    chain: [
+      { parallel: [{ agent: "a", task: "A" }, { agent: "b", task: "B" }], failFast: false },
+      { agent: "synth", task: "Synthesize:\n{{previous}}" },
+    ],
+  } as any, "scope");
+
+  assert.deepEqual(requests.map((request) => request.agent), ["a", "b", "synth"]);
+  assert.match(requests[2].task, /b websocket closed/);
+  const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
+  assert.equal(result.details.isError, true);
+  assert.match(result.content, /synth saw/);
+}));
+
+test("failFast false converts thrown parallel child errors into synthesizer input", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-thrown-child-"));
+  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    if (params.agent === "synth") return { text: `synth saw:\n${params.task}` };
+    return { text: `${params.agent} ok` };
   });
 
   await runWorkflow(pi as any, createCtx(cwd) as any, {
     name: "parent",
     sourcePath: "parent.jsonc",
-    context: "fork",
     chain: [
-      { agent: "inline", task: "inline {{args}}" },
-      { workflow: "child", args: "child" },
+      { parallel: [{ workflow: "missing-child" }, { agent: "security", task: "security" }], failFast: false },
+      { agent: "synth", task: "Synthesize:\n{{previous}}" },
     ],
   } as any, "scope");
 
-  assert.deepEqual(requests.filter((request) => request.agent === "inline").map((request) => request.context), ["fork", "fresh"]);
-});
+  assert.deepEqual(requests.map((request) => request.agent), ["security", "synth"]);
+  assert.match(requests[1].task, /Nested workflow not found: missing-child/);
+  const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
+  assert.equal(result.details.isError, true);
+  assert.match(result.content, /synth saw/);
+}));
 
-test("composite inline agents respect forkFallback error", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-fork-error-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "child.jsonc"), `{ "name": "child", "agent": "child-agent", "task": "child {{args}}" }`);
-  const events = createEvents();
+test("nested workflow partial failures are preserved through parent parallel synthesis", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-nested-partial-"));
+  writeWorkflow(join(cwd, ".pi", "workflows"), "child-sweep", `{
+    "name": "child-sweep",
+    "chain": [
+      { "parallel": [{ "agent": "child-a", "task": "A" }, { "agent": "child-b", "task": "B" }], "failFast": false },
+      { "agent": "child-synth", "task": "child synth {{previous}}" }
+    ]
+  }`);
+  const pi = createPi();
   const requests: any[] = [];
-  const pi = { events, sendMessage() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string; context?: string } };
-    requests.push(request.params);
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: true,
-        errorText: "Failed to create forked subagent session",
-        result: { content: [{ type: "text", text: "fork failed" }] },
-      });
-    }, 0);
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    if (params.agent === "child-b") return { isError: true, errorText: "child b failed", text: "child b failed" };
+    if (params.agent === "child-synth") return { text: `child synthesized:\n${params.task}` };
+    if (params.agent === "parent-synth") return { text: `parent synthesized:\n${params.task}` };
+    return { text: `${params.agent} ok` };
+  });
+
+  await runWorkflow(pi as any, createCtx(cwd) as any, {
+    name: "parent",
+    sourcePath: "parent.jsonc",
+    chain: [
+      { parallel: [{ workflow: "child-sweep" }, { agent: "parent-other", task: "other" }], failFast: false },
+      { agent: "parent-synth", task: "parent synth {{previous}}" },
+    ],
+  } as any, "scope");
+
+  assert.ok(requests.some((request) => request.agent === "child-synth"));
+  assert.ok(requests.some((request) => request.agent === "parent-synth"));
+  const parentSynth = requests.find((request) => request.agent === "parent-synth");
+  assert.match(parentSynth.task, /child b failed/);
+  const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
+  assert.equal(result.details.isError, true);
+  assert.ok(result.details.result.details.partialFailures.length >= 1);
+}));
+
+test("nested workflows and agents compose with failFast false", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-"));
+  writeWorkflow(join(cwd, ".pi", "workflows"), "child-review", `{ "name": "child-review", "agent": "child-agent", "task": "child {{args}}" }`);
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    if (params.agent === "security") return { isError: true, errorText: "security failed", text: "security failed" };
+    if (params.agent === "synth") return { text: `synth saw:\n${params.task}` };
+    return { text: `${params.agent} output:\n${params.task}` };
+  });
+
+  await runWorkflow(pi as any, createCtx(cwd) as any, {
+    name: "parent",
+    sourcePath: "parent.jsonc",
+    chain: [
+      { parallel: [{ workflow: "child-review", args: "nested {{args}}" }, { agent: "security", task: "security {{args}}" }], failFast: false },
+      { agent: "synth", task: "synthesize {{previous}}" },
+    ],
+  } as any, "scope");
+
+  assert.deepEqual(requests.map((request) => request.agent), ["child-agent", "security", "synth"]);
+  assert.match(requests[2].task, /child-agent output:\nchild nested scope/);
+  assert.match(requests[2].task, /security failed/);
+  const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
+  assert.equal(result.details.isError, true, "partial failures are visible in result details");
+  assert.match(result.content, /synth saw/);
+}));
+
+test("nested workflows abort before later chain steps when failFast is true", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-failfast-"));
+  writeWorkflow(join(cwd, ".pi", "workflows"), "child-review", `{ "name": "child-review", "agent": "child-agent", "task": "child {{args}}" }`);
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    if (params.agent === "security") return { isError: true, errorText: "security failed", text: "security failed" };
+    return { text: `${params.agent} ok` };
   });
 
   await assert.rejects(
     runWorkflow(pi as any, createCtx(cwd) as any, {
       name: "parent",
       sourcePath: "parent.jsonc",
-      context: "fork",
-      forkFallback: "error",
-      chain: [
-        { agent: "inline", task: "inline {{args}}" },
-        { workflow: "child", args: "child" },
-      ],
-    } as any, "scope"),
-    /Failed to create forked subagent session/,
-  );
-  assert.deepEqual(requests.map((request) => request.context), ["fork"]);
-});
-
-test("composite parallel agents honor count, worktree, chainDir, and first-step task defaults", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-options-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "child.jsonc"), `{ "name": "child", "agent": "child-agent", "task": "child" }`);
-  const events = createEvents();
-  const requests: any[] = [];
-  const pi = { events, sendMessage() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string } };
-    requests.push(request.params);
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false, result: { content: [{ type: "text", text: `${request.params.agent} ok` }] } });
-    }, 0);
-  });
-
-  await runWorkflow(pi as any, createCtx(cwd) as any, {
-    name: "parent",
-    sourcePath: "parent.jsonc",
-    context: "fresh",
-    chainDir: "/tmp/chain-{{1}}",
-    chain: [
-      { parallel: [{ agent: "taskless-a", count: 2 }, { agent: "taskless-b" }], worktree: true, failFast: false },
-      { workflow: "child" },
-    ],
-  } as any, "scope");
-
-  const parallelRequests = requests.filter((request) => request.agent?.startsWith("taskless-"));
-  assert.equal(parallelRequests.length, 3);
-  assert.deepEqual(parallelRequests.map((request) => request.task), ["scope", "scope", "scope"]);
-  assert.deepEqual(parallelRequests.map((request) => request.worktree), [true, true, true]);
-  assert.deepEqual(parallelRequests.map((request) => request.chainDir), ["/tmp/chain-scope", "/tmp/chain-scope", "/tmp/chain-scope"]);
-  assert.equal(requests.find((request) => request.agent === "child-agent")?.chainDir, "/tmp/chain-scope");
-});
-
-test("composite parallel failFast true aborts before synthesis", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-failfast-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "child-review.jsonc"), `{ "name": "child-review", "agent": "child-agent", "task": "child {{args}}" }`);
-  const events = createEvents();
-  const requests: any[] = [];
-  const pi = { events, sendMessage() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string } };
-    requests.push(request.params);
-    const isChild = request.params.agent === "child-agent";
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: isChild, errorText: isChild ? "child failed" : undefined, result: { content: [{ type: "text", text: isChild ? "child failed" : "ok" }] } });
-    }, 0);
-  });
-
-  await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, {
-      name: "quality-sweep",
-      sourcePath: "quality-sweep.jsonc",
       chain: [
         { parallel: [{ workflow: "child-review" }, { agent: "security", task: "security" }], failFast: true },
-        { agent: "synth", task: "{{previous}}" },
+        { agent: "synth", task: "should not run" },
       ],
     } as any, "scope"),
-    /child failed/,
+    /security failed/,
   );
-  assert.equal(requests.some((request) => request.agent === "synth"), false);
-});
+  assert.deepEqual(requests.map((request) => request.agent).sort(), ["child-agent", "security"]);
+}));
 
-test("composite failFast reports skipped parallel runnables", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-failfast-skips-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "child-review.jsonc"), `{ "name": "child-review", "agent": "child-agent", "task": "child {{args}}" }`);
-  const events = createEvents();
-  const messages: any[] = [];
+test("nested workflow execution is recursive and detects cycles", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-recursive-"));
+  const workflowDir = join(cwd, ".pi", "workflows");
+  writeWorkflow(workflowDir, "grandchild", `{ "name": "grandchild", "agent": "grand", "task": "grand {{args}}" }`);
+  writeWorkflow(workflowDir, "child", `{ "name": "child", "chain": [{ "workflow": "grandchild", "args": "from child {{args}}" }] }`);
+  writeWorkflow(workflowDir, "cycle", `{ "name": "cycle", "chain": [{ "workflow": "cycle" }] }`);
+  const pi = createPi();
   const requests: any[] = [];
-  const pi = { events, sendMessage: (message: any) => messages.push(message) };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string } };
-    requests.push(request.params);
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: true, errorText: "child failed", result: { content: [{ type: "text", text: "child failed" }] } });
-    }, 0);
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    return { text: `${params.agent}: ${params.task}` };
   });
 
+  await runWorkflow(pi as any, createCtx(cwd) as any, { name: "parent", sourcePath: "parent.jsonc", chain: [{ workflow: "child", args: "scope" }] } as any, "ignored");
+  assert.equal(requests[0].agent, "grand");
+  assert.equal(requests[0].task, "grand from child scope");
+
   await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, {
-      name: "quality-sweep",
-      sourcePath: "quality-sweep.jsonc",
-      chain: [
-        { parallel: [{ workflow: "child-review" }, { agent: "security", task: "security" }], concurrency: 1, failFast: true },
-        { agent: "synth", task: "{{previous}}" },
-      ],
-    } as any, "scope"),
-    /child failed/,
+    runWorkflow(pi as any, createCtx(cwd) as any, { name: "cycle-parent", sourcePath: "cycle-parent.jsonc", chain: [{ workflow: "cycle" }] } as any, "scope"),
+    /Workflow composition recursion detected/,
   );
+}));
 
-  assert.deepEqual(requests.map((request) => request.agent), ["child-agent"]);
-  const result = messages.findLast((message) => message.customType === "pi-workflows-result");
-  assert.ok(result);
-  assert.match(result.content, /child failed/);
-  assert.match(JSON.stringify(result.details.result.details.results), /Agent: security/);
-  assert.match(JSON.stringify(result.details.result.details.results), /Skipped because failFast/);
-});
-
-test("parent composite context and forkFallback policy control nested workflows", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-parent-policy-"));
+test("missing nested workflows fail clearly", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-missing-"));
   mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "fork-child.jsonc"), `{ "name": "fork-child", "context": "fork", "agent": "child-agent", "task": "child" }`);
-  const events = createEvents();
-  const requests: any[] = [];
-  let failFork = false;
-  const pi = { events, sendMessage() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { agent?: string; context?: string } };
-    requests.push(request.params);
-    const shouldFailFork = failFork && request.params.context === "fork";
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: shouldFailFork,
-        errorText: shouldFailFork ? "Failed to create forked subagent session" : undefined,
-        result: { content: [{ type: "text", text: shouldFailFork ? "fork failed" : "ok" }] },
-      });
-    }, 0);
-  });
-
-  await runWorkflow(pi as any, createCtx(cwd) as any, {
-    name: "parent",
-    sourcePath: "parent.jsonc",
-    chain: [{ workflow: "fork-child" }],
-  } as any, "scope");
-
-  assert.deepEqual(requests.map((request) => request.context), ["fresh"]);
-
-  requests.length = 0;
-  failFork = true;
-
+  const pi = createPi();
   await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, {
-      name: "strict-parent",
-      sourcePath: "strict-parent.jsonc",
-      context: "fork",
-      forkFallback: "error",
-      chain: [{ workflow: "fork-child" }],
-    } as any, "scope"),
-    /Failed to create forked subagent session/,
+    runWorkflow(pi as any, createCtx(cwd) as any, { name: "parent", sourcePath: "parent.jsonc", chain: [{ workflow: "missing" }] } as any, "scope"),
+    /Nested workflow not found: missing/,
   );
-  assert.deepEqual(requests.map((request) => request.context), ["fork"]);
-});
+}));
 
-test("composite fork dispatch requires UI session persistence before child launch", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-fork-persist-"));
-  const events = createEvents();
-  const requests: any[] = [];
-  const pi = { events, sendMessage() {}, appendEntry() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    requests.push(data);
-  });
-  const ctx = {
-    ...createCtx(cwd),
-    hasUI: true,
-    sessionManager: {
-      getSessionFile: () => undefined,
-    },
-  };
-
-  await assert.rejects(
-    runWorkflow(pi as any, ctx as any, {
-      name: "parent",
-      sourcePath: "parent.jsonc",
-      context: "fork",
-      chain: [{ agent: "child", task: "child" }],
-    } as any, "scope"),
-    /session file path unavailable/,
-  );
-
-  assert.equal(requests.length, 0);
-});
-
-test("composite fork child dispatch persists session snapshot before request", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-fork-dispatch-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "second-child.jsonc"), `{ "name": "second-child", "agent": "second", "task": "second" }`);
-  const events = createEvents();
-  const rewrites: number[] = [];
-  const requests: any[] = [];
-  const pi = { events, sendMessage() {} };
-  events.on(REQUEST_EVENT, (data) => {
-    requests.push(data);
-    assert.ok(rewrites.length >= 2, "startup and per-dispatch fork snapshots should be persisted before child launch");
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false, result: { content: [{ type: "text", text: "ok" }] } });
-    }, 0);
-  });
-  const ctx = {
-    ...createCtx(cwd),
-    hasUI: true,
-    sessionManager: {
-      getSessionFile: () => join(cwd, "session.jsonl"),
-      _rewriteFile: () => rewrites.push(rewrites.length + 1),
-    },
-  };
-
-  await runWorkflow(pi as any, ctx as any, {
-    name: "parent",
-    sourcePath: "parent.jsonc",
-    context: "fork",
-    chain: [{ agent: "child", task: "child" }, { workflow: "second-child" }],
-  } as any, "scope");
-
-  assert.equal(requests.length, 2);
-  assert.ok(rewrites.length >= 3, "startup, dispatch, and result snapshots should be persisted");
-});
-
-test("composite inline agent completion-guard output stays failed", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-guard-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "unused-child.jsonc"), `{ "name": "unused-child", "agent": "child", "task": "child" }`);
-  const events = createEvents();
-  const messages: any[] = [];
-  const pi = { events, sendMessage: (message: any) => messages.push(message) };
-  const guardError = "Subagent completed without making edits for an implementation task.";
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: true,
-        result: {
-          content: [{ type: "text", text: guardError }],
-          details: { results: [{ agent: "writer", exitCode: 1, error: guardError, finalOutput: "draft output" }] },
-        },
-      });
-    }, 0);
-  });
-
-  await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, {
-      name: "review-parent",
-      description: "Review wrapper",
-      sourcePath: "review-parent.jsonc",
-      chain: [{ agent: "writer", task: "write" }, { workflow: "unused-child" }],
-    } as any, "scope"),
-    /completed without making edits/,
-  );
-
-  const result = messages.findLast((message) => message.customType === "pi-workflows-result");
-  assert.ok(result);
-  assert.equal(result.details.isError, true);
-  assert.match(result.content, /draft output/);
-  assert.match(result.content, /Showing the produced output below/);
-});
-
-test("composite workflow error result reporting failures are aggregated", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-reporting-"));
-  let sendCount = 0;
-  const pi = {
-    events: createEvents(),
-    sendMessage() {
-      sendCount += 1;
-      if (sendCount > 1) throw new Error("send failed");
-    },
-  };
-
-  await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, {
-      name: "parent",
-      sourcePath: "parent.jsonc",
-      chain: [{ workflow: "missing-child" }],
-    } as any, "scope"),
-    (error: unknown) => error instanceof AggregateError && /failed and failed to report error result/.test(error.message),
-  );
-});
-
-test("composite workflows reject nested workflow depth beyond one level", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-composite-depth-"));
-  mkdirSync(join(cwd, ".pi", "workflows"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows", "grandchild.jsonc"), `{ "name": "grandchild", "agent": "a", "task": "t" }`);
-  writeFileSync(join(cwd, ".pi", "workflows", "child.jsonc"), `{ "name": "child", "chain": [{ "workflow": "grandchild" }] }`);
-  const pi = { events: createEvents(), sendMessage() {} };
-  await assert.rejects(
-    runWorkflow(pi as any, createCtx(cwd) as any, { name: "parent", sourcePath: "parent.jsonc", chain: [{ workflow: "child" }] } as any, "scope"),
-    /supports only one nested workflow level/,
-  );
-});
-
-test("top-level skill aliases are parsed and forwarded", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-skills-"));
-  const singleFile = join(dir, "single.jsonc");
-  writeFileSync(singleFile, `{ "name": "single-skill", "agent": "delegate", "skills": ["keystone-risk"], "task": "Review {{args}}" }`);
-
-  const singleWorkflow = parseWorkflowFile(singleFile)!;
-  assert.deepEqual(singleWorkflow.skill, ["keystone-risk"]);
-  const singleParams = buildSubagentParams(singleWorkflow, "the diff", { args: "the diff", positional: ["the", "diff"] } as any, createCtx() as any);
-  assert.deepEqual(singleParams.skill, ["keystone-risk"]);
-  assert.equal(singleParams.task, "Review the diff");
-
-  const chainFile = join(dir, "chain.jsonc");
-  writeFileSync(chainFile, `{ "name": "chain-skill", "skill": "shared-skill", "chain": [{ "agent": "delegate", "task": "Review" }] }`);
-  const chainParams = buildSubagentParams(parseWorkflowFile(chainFile)!, "", { args: "", positional: [] } as any, createCtx() as any);
-  assert.equal(chainParams.skill, "shared-skill");
-
-  const commaFile = join(dir, "comma.jsonc");
-  writeFileSync(commaFile, `{ "name": "comma-skill", "agent": "delegate", "skill": "risk, security", "task": "Review" }`);
-  assert.deepEqual(parseWorkflowFile(commaFile)!.skill, ["risk", "security"]);
-});
-
-test("top-level skills are parsed and applied to top-level parallel tasks", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-parallel-skills-"));
-  const file = join(dir, "parallel.jsonc");
-  writeFileSync(file, `{
-    "name": "parallel-skill-test",
-    "skills": ["shared"],
-    "tasks": [
-      { "agent": "one", "task": "one" },
-      { "agent": "two", "task": "two", "skill": false }
-    ]
-  }`);
-
-  const params = buildSubagentParams(parseWorkflowFile(file)!, "", { args: "", positional: [] } as any, createCtx() as any);
-  assert.deepEqual(params.tasks?.[0].skill, ["shared"]);
-  assert.equal(params.tasks?.[1].skill, false);
-  assert.equal(params.skill, undefined);
-});
-
-test("step and task skills aliases are parsed", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-nested-skills-"));
-  const chainFile = join(dir, "chain.jsonc");
-  writeFileSync(chainFile, `{
-    "name": "nested-chain-skills",
-    "chain": [
-      { "agent": "first", "task": "one", "skills": ["step-skill"] },
-      { "parallel": [{ "agent": "second", "task": "two", "skills": ["parallel-skill"] }] }
-    ]
-  }`);
-  const chainWorkflow = parseWorkflowFile(chainFile)!;
-  assert.deepEqual((chainWorkflow.chain?.[0] as any).skill, ["step-skill"]);
-  assert.deepEqual((chainWorkflow.chain?.[1] as any).parallel[0].skill, ["parallel-skill"]);
-
-  const tasksFile = join(dir, "tasks.jsonc");
-  writeFileSync(tasksFile, `{
-    "name": "nested-task-skills",
-    "tasks": [{ "agent": "delegate", "task": "t", "skills": ["task-skill"] }]
-  }`);
-  const tasksWorkflow = parseWorkflowFile(tasksFile)!;
-  assert.deepEqual(tasksWorkflow.tasks?.[0].skill, ["task-skill"]);
-});
-
-test("skill and skills aliases are mutually exclusive", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-skill-conflict-"));
-  const cases = [
-    [`{ "name": "root-conflict", "agent": "delegate", "skill": "a", "skills": ["b"], "task": "t" }`, /Workflow root-conflict must not define both skill and skills/],
-    [`{ "name": "task-conflict", "tasks": [{ "agent": "delegate", "task": "t", "skill": "a", "skills": ["b"] }] }`, /Workflow task-conflict\.tasks\[0\] must not define both skill and skills/],
-    [`{ "name": "chain-conflict", "chain": [{ "agent": "delegate", "task": "t", "skill": "a", "skills": ["b"] }] }`, /Workflow chain-conflict\.chain\[0\] must not define both skill and skills/],
-    [`{ "name": "parallel-conflict", "chain": [{ "parallel": [{ "agent": "delegate", "task": "t", "skill": "a", "skills": ["b"] }] }] }`, /Workflow parallel-conflict\.chain\[0\]\.parallel\[0\] must not define both skill and skills/],
-  ] as const;
-
-  cases.forEach(([content, expected], index) => {
-    const file = join(dir, `conflict-${index}.jsonc`);
-    writeFileSync(file, content);
-    assert.throws(() => parseWorkflowFile(file), expected);
-  });
-});
-
-test("malformed skill specs are rejected", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-invalid-skills-"));
-  const cases = [
-    `{ "name": "empty-array", "agent": "delegate", "skills": [], "task": "t" }`,
-    `{ "name": "empty-array-entry", "agent": "delegate", "skills": ["ok", ""], "task": "t" }`,
-    `{ "name": "blank-array-entry", "agent": "delegate", "skills": ["   "], "task": "t" }`,
-    `{ "name": "comma-only", "agent": "delegate", "skill": ",", "task": "t" }`,
-    `{ "name": "empty-comma-token", "agent": "delegate", "skill": "risk,,security", "task": "t" }`,
-  ];
-
-  cases.forEach((content, index) => {
-    const file = join(dir, `invalid-${index}.jsonc`);
-    writeFileSync(file, content);
-    assert.throws(() => parseWorkflowFile(file), /must include at least one non-empty skill name|must not contain empty comma-separated entries/);
-  });
-});
-
-test("workflow custom messages force a session snapshot even before an assistant message exists", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const rewrites: number[] = [];
-  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-session-snapshot-"));
-  const sessionFile = join(sessionDir, "session.jsonl");
-  const sessionManager = {
-    flushed: false,
-    getSessionFile() {
-      return sessionFile;
-    },
-    _rewriteFile() {
-      rewrites.push(messages.length);
-    },
-  };
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "final review" }], details: { results: [] } },
-      });
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    { ...createCtx(), sessionManager } as any,
-    { name: "snapshot-test", sourcePath: "snapshot-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-    "",
-  );
-
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
-  assert.deepEqual(rewrites, [1, 2]);
-  assert.equal(sessionManager.flushed, true);
-});
-
-test("review workflows recover synthesized output from no-edit completion guard failures", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-
-  const synthesizedReview = "## Summary\n\nFinal synthesized review output.";
-  const guardError = "Subagent completed without making edits for an implementation task.\nIt appears to have returned planning or scratchpad output instead of applying changes.";
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: true,
-        result: {
-          content: [{ type: "text", text: `❌ Chain failed: ${guardError}` }],
-          details: {
-            results: [{
-              agent: "review-synthesizer",
-              exitCode: 1,
-              error: guardError,
-              finalOutput: synthesizedReview,
-            }],
-          },
-        },
-      });
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    createCtx() as any,
-    { name: "review-agents", description: "Multi-agent code review", sourcePath: "review-agents.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-    "",
-  );
-
-  const result = messages.find((message) => message.customType === "pi-workflows-result");
-  assert.ok(result);
-  assert.equal(result.details.isError, false);
-  assert.equal(result.details.recoveredCompletionGuard, true);
-  assert.match(result.content, /completion-guard failure/);
-  assert.match(result.content, /Final synthesized review output/);
-});
-
-test("runtime flag extraction preserves quoted positional arguments", async () => {
-  const events = createEvents();
-  const requests: any[] = [];
-  const pi = {
-    events,
-    sendMessage() {},
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: any };
-    requests.push(request);
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "ok" }] },
-      });
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    createCtx() as any,
-    {
-      name: "quoted-test",
-      sourcePath: "quoted-test.jsonc",
-      agent: "a",
-      task: "first={{1}} second={{2}} args={{args}}",
-      modelPolicy: "agent",
-    } as any,
-    '"two words" --fork next --clarify',
-  );
-
-  assert.equal(requests[0].params.context, "fork");
-  assert.equal(requests[0].params.clarify, true);
-  assert.equal(requests[0].params.task, "first=two words second=next args=two words next");
-});
-
-test("JSONC parsing removes comments and trailing commas without rewriting prompt strings", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-parser-"));
-  const file = join(dir, "workflow.jsonc");
-  writeFileSync(
-    file,
-    `{
-      // comment
-      "name": "parser-test",
-      "agent": "reviewer",
-      "task": "Keep these exact snippets: \\", }\\" and \\", ]\\"",
-      "chain": [
-        { "agent": "a", "task": "t" },
-      ],
-    }`,
-  );
-
-  const workflow = parseWorkflowFile(file)!;
-  assert.equal(workflow.task, "Keep these exact snippets: \", }\" and \", ]\"");
-  assert.equal(workflow.chain?.length, 1);
-});
-
-test("loadWorkflows skips malformed files while loading valid workflows", () => {
+test("loadWorkflows skips malformed files, rejects removed fields, and keeps valid workflows", () => withTempHome(() => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-load-"));
   const workflowDir = join(cwd, ".pi", "workflows");
-  mkdirSync(workflowDir, { recursive: true });
-  writeFileSync(join(workflowDir, "good.jsonc"), `{ "name": "good-load-test", "agent": "a", "task": "t" }`);
-  writeFileSync(join(workflowDir, "bad.jsonc"), `{ "name": "bad-load-test", `);
-
-  const warnings: Array<{ path: string; error: string }> = [];
+  writeWorkflow(workflowDir, "good", `{ "name": "good", "agent": "a", "task": "t", "model": "m" }`);
+  writeWorkflow(workflowDir, "bad-json", `{ "name": "bad", `);
+  writeWorkflow(workflowDir, "bad-field", `{ "name": "bad-field", "agent": "a", "task": "t", "forkFallback": "error" }`);
+  const warnings: any[] = [];
   const workflows = loadWorkflows(cwd, warnings, true, ["project"]);
-  assert.ok(workflows.some((workflow) => workflow.name === "good-load-test"));
-  assert.ok(warnings.some((warning) => warning.path.endsWith("bad.jsonc") && warning.error));
-});
+  assert.deepEqual(workflows.map((workflow) => workflow.name), ["good"]);
+  assert.ok(warnings.some((warning) => warning.path.endsWith("bad-json.jsonc")));
+  assert.ok(warnings.some((warning) => warning.path.endsWith("bad-field.jsonc") && /forkFallback is not supported/.test(warning.error)));
+}));
 
-test("loadWorkflows skips structurally invalid workflow files with warnings", () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-schema-"));
-  const workflowDir = join(cwd, ".pi", "workflows");
-  mkdirSync(workflowDir, { recursive: true });
-  writeFileSync(join(workflowDir, "good.jsonc"), `{ "name": "schema-good", "agent": "a", "task": "t", "forkFallback": "error" }`);
-  writeFileSync(join(workflowDir, "bad-chain.jsonc"), `{ "name": "bad-chain", "chain": {} }`);
-  writeFileSync(join(workflowDir, "bad-task.jsonc"), `{ "name": "bad-task", "agent": "a", "task": {} }`);
-  writeFileSync(join(workflowDir, "bad-policy.jsonc"), `{ "name": "bad-policy", "agent": "a", "task": "t", "modelPolicy": "typo" }`);
-  writeFileSync(join(workflowDir, "bad-fallback.jsonc"), `{ "name": "bad-fallback", "agent": "a", "task": "t", "forkFallback": "typo" }`);
-
-  const warnings: Array<{ path: string; error: string }> = [];
-  const workflows = loadWorkflows(cwd, warnings, true, ["project"]);
-  assert.deepEqual(workflows.map((workflow) => workflow.name), ["schema-good"]);
-  assert.equal(warnings.length, 4);
-  assert.ok(warnings.some((warning) => warning.path.endsWith("bad-chain.jsonc") && /chain must be an array/.test(warning.error)));
-  assert.ok(warnings.some((warning) => warning.path.endsWith("bad-task.jsonc") && /task must be a string/.test(warning.error)));
-  assert.ok(warnings.some((warning) => warning.path.endsWith("bad-policy.jsonc") && /modelPolicy must be one of/.test(warning.error)));
-  assert.ok(warnings.some((warning) => warning.path.endsWith("bad-fallback.jsonc") && /forkFallback must be one of/.test(warning.error)));
-});
-
-test("directory-level workflow discovery errors are reported as warnings", () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-dir-warning-"));
-  mkdirSync(join(cwd, ".pi"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "workflows"), "not a directory");
-
-  const warnings: Array<{ path: string; error: string }> = [];
-  const workflows = loadWorkflows(cwd, warnings, true, ["project"]);
-  assert.deepEqual(workflows, []);
-  assert.equal(warnings.length, 1);
-  assert.ok(warnings[0].path.endsWith(join(".pi", "workflows")));
-  assert.match(warnings[0].error, /not a directory|could not be read/);
-});
-
-test("malformed project workflow shadows same-named global workflow when name is extractable", () => withTempHome((home) => {
-  const globalDir = join(home, ".pi", "agent", "workflows");
-  mkdirSync(globalDir, { recursive: true });
-  writeFileSync(join(globalDir, "shadow.jsonc"), `{ "name": "shadow-test", "agent": "global", "task": "global" }`);
-
+test("project workflows override user workflows and malformed project files shadow user names", () => withTempHome((home) => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-shadow-"));
+  const userDir = join(home, ".pi", "agent", "workflows");
   const projectDir = join(cwd, ".pi", "workflows");
-  mkdirSync(projectDir, { recursive: true });
-  writeFileSync(join(projectDir, "shadow.jsonc"), `{ "name": "shadow-test", `);
+  writeWorkflow(userDir, "review", `{ "name": "review", "agent": "user", "task": "user" }`);
+  writeWorkflow(projectDir, "review", `{ "name": "review", "agent": "project", "task": "project" }`);
+  let workflows = loadWorkflows(cwd, [], true);
+  assert.equal(workflows.find((workflow) => workflow.name === "review")?.agent, "project");
 
-  const warnings: Array<{ path: string; error: string }> = [];
-  const workflows = loadWorkflows(cwd, warnings);
-  assert.equal(workflows.some((workflow) => workflow.name === "shadow-test"), false);
-  assert.ok(warnings.some((warning) => warning.path.endsWith("shadow.jsonc") && warning.error));
+  writeWorkflow(projectDir, "review", `{ "name": "review", `);
+  let warnings: any[] = [];
+  workflows = loadWorkflows(cwd, warnings, true);
+  assert.equal(workflows.find((workflow) => workflow.name === "review"), undefined);
+  assert.ok(warnings.length > 0);
+
+  writeFileSync(join(projectDir, "review.jsonc"), `{ "agent": `);
+  warnings = [];
+  workflows = loadWorkflows(cwd, warnings, true);
+  assert.equal(workflows.find((workflow) => workflow.name === "review"), undefined);
+  assert.ok(warnings.length > 0);
 }));
 
-test("malformed project workflow without extractable name does not shadow global by filename", () => withTempHome((home) => {
-  const globalDir = join(home, ".pi", "agent", "workflows");
-  mkdirSync(globalDir, { recursive: true });
-  writeFileSync(join(globalDir, "review.jsonc"), `{ "name": "review", "agent": "global", "task": "global" }`);
-
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-no-shadow-"));
-  const projectDir = join(cwd, ".pi", "workflows");
-  mkdirSync(projectDir, { recursive: true });
-  writeFileSync(join(projectDir, "review.jsonc"), `{ "agent": "project", `);
-
-  const warnings: Array<{ path: string; error: string }> = [];
-  const workflows = loadWorkflows(cwd, warnings);
-  assert.equal(workflows.some((workflow) => workflow.name === "review"), true);
-  assert.ok(warnings.some((warning) => warning.path.endsWith("review.jsonc") && warning.error));
-}));
-
-test("runWorkflow renders error responses as failures and propagates failure", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
+test("runWorkflow reports subagent errors and nested result failures", async () => {
+  const pi = createPi();
+  respondToRequests(pi, () => ({
+    isError: false,
+    result: {
+      content: [{ type: "text", text: "summary" }],
+      details: { results: [{ agent: "bad", exitCode: 1, finalOutput: "nested failed" }] },
     },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: true,
-        errorText: "agent failed loudly",
-        result: {
-          details: {
-            results: [
-              { agent: "first", exitCode: 0, finalOutput: "successful output should not be shown" },
-              { agent: "second", exitCode: 1, error: "second failed" },
-            ],
-          },
-        },
-      });
-    }, 0);
-  });
+  }));
 
   await assert.rejects(
-    runWorkflow(
-      pi as any,
-      createCtx() as any,
-      { name: "error-test", sourcePath: "error-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-      "",
-    ),
-    /agent failed loudly/,
-  );
-
-  const result = messages.find((message) => message.customType === "pi-workflows-result");
-  assert.equal(result.details.isError, true);
-  assert.equal(result.details.errorText, "agent failed loudly");
-  assert.equal(result.content, "agent failed loudly");
-  assert.doesNotMatch(result.content, /successful output/);
-});
-
-test("runWorkflow treats nested result failures as failed even without top-level isError", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        result: {
-          isError: true,
-          details: { results: [{ agent: "bad", exitCode: 1, finalOutput: "nested failed" }] },
-        },
-      });
-    }, 0);
-  });
-
-  await assert.rejects(
-    runWorkflow(
-      pi as any,
-      createCtx() as any,
-      { name: "nested-error-test", sourcePath: "nested-error-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-      "",
-    ),
+    runWorkflow(pi as any, createCtx() as any, { name: "bad", sourcePath: "bad.jsonc", agent: "a", task: "t" } as any, "scope"),
     /nested failed/,
   );
-
-  const result = messages.find((message) => message.customType === "pi-workflows-result");
+  const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
   assert.equal(result.details.isError, true);
-  assert.equal(result.details.errorText, "nested failed");
-  assert.equal(result.content, "nested failed");
+  assert.match(result.content, /nested failed/);
 });
 
-test("workflow result renderer marks error-only agent results as failed", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const renderers = new Map<string, any>();
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-    registerCommand() {},
-    on() {},
-    registerMessageRenderer(type: string, renderer: any) {
-      renderers.set(type, renderer);
-    },
+test("runWorkflow aggregates result-reporting failures with the original error", async () => {
+  const pi = createPi();
+  respondToRequests(pi, () => ({ isError: true, errorText: "subagent failed", text: "subagent failed" }));
+  let sendCount = 0;
+  pi.sendMessage = (message: any) => {
+    sendCount += 1;
+    if (sendCount > 1) throw new Error("send failed");
+    pi.messages.push(message);
   };
-
-  registerPiWorkflows(pi as any);
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: {
-          details: { results: [{ agent: "reviewer", error: "timed out before finishing" }] },
-        },
-      });
-    }, 0);
-  });
 
   await assert.rejects(
-    runWorkflow(
-      pi as any,
-      createCtx() as any,
-      { name: "error-only-render-test", sourcePath: "error-only-render-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-      "",
-    ),
-    /timed out before finishing/,
+    runWorkflow(pi as any, createCtx() as any, { name: "report", sourcePath: "report.jsonc", agent: "a", task: "t" } as any, "scope"),
+    (error: any) => error.name === "AggregateError" && /subagent failed/.test(error.message) && error.errors.some((candidate: Error) => /send failed/.test(candidate.message)),
   );
-
-  const resultRenderer = renderers.get("pi-workflows-result");
-  assert.ok(resultRenderer);
-  const resultMessage = messages.find((message) => message.customType === "pi-workflows-result");
-  const expandedLines = resultRenderer(resultMessage, { expanded: true }).render(120).join("\n");
-  assert.match(expandedLines, /✗ reviewer · failed/);
-  assert.doesNotMatch(expandedLines, /✓ reviewer · done/);
 });
 
-test("malformed subagent responses aggregate reporting failures without masking the original", async () => {
-  const events = createEvents();
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      if (message.customType === "pi-workflows-result") throw new Error("send failed");
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, { requestId: request.requestId, isError: false });
-    }, 0);
-  });
-
-  const originalConsoleError = console.error;
-  console.error = () => {};
-  try {
-    await assert.rejects(
-      runWorkflow(
-        pi as any,
-        createCtx() as any,
-        { name: "malformed-response-test", sourcePath: "malformed-response-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-        "",
-      ),
-      (error: any) => {
-        assert.equal(error.name, "AggregateError");
-        assert.ok(error.errors.some((candidate: any) => /malformed pi-subagents response: result must be an object/.test(candidate.message)));
-        assert.ok(error.errors.some((candidate: any) => /send failed/.test(candidate.message)));
-        return true;
-      },
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-});
-
-test("fork fallback retries once with fresh context", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const renderers = new Map<string, any>();
-  const seenContexts: string[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-    registerCommand() {},
-    on() {},
-    registerMessageRenderer(type: string, renderer: any) {
-      renderers.set(type, renderer);
-    },
-  };
-
+test("registerPiWorkflows registers renderers, generic command, and only user direct commands", () => withTempHome((home) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-register-"));
+  writeWorkflow(join(home, ".pi", "agent", "workflows"), "global", `{ "name": "global", "agent": "a", "task": "t" }`);
+  writeWorkflow(join(cwd, ".pi", "workflows"), "local", `{ "name": "local", "agent": "a", "task": "t" }`);
+  const pi = createPi();
   registerPiWorkflows(pi as any);
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { context?: string } };
-    seenContexts.push(request.params.context ?? "");
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      if (seenContexts.length === 1) {
-        events.emit(RESPONSE_EVENT, {
-          requestId: request.requestId,
-          isError: true,
-          errorText: "Failed to create forked subagent session",
-          result: { content: [{ type: "text", text: "fork failed" }] },
-        });
-      } else {
-        events.emit(RESPONSE_EVENT, {
-          requestId: request.requestId,
-          isError: false,
-          result: { content: [{ type: "text", text: "fresh ok" }] },
-        });
-      }
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    createCtx() as any,
-    { name: "fork-test", sourcePath: "fork-test.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
-    "",
-  );
-
-  assert.deepEqual(seenContexts, ["fork", "fresh"]);
-  const result = messages.findLast((message) => message.customType === "pi-workflows-result");
-  assert.equal(result.details.retriedFromFork, true);
-  assert.match(result.content, /fresh ok/);
-
-  const progressRenderer = renderers.get("pi-workflows-progress");
-  assert.ok(progressRenderer);
-  const progressMessages = messages.filter((message) => message.customType === "pi-workflows-progress");
-  assert.equal(progressMessages.length, 2);
-  const firstProgressLines = progressRenderer(progressMessages[0], { expanded: false }).render(120).join("\n");
-  assert.match(firstProgressLines, /workflow \/fork-test \| failed/);
-  assert.doesNotMatch(firstProgressLines, /Running workflow/);
-  const firstExpandedProgressLines = progressRenderer(progressMessages[0], { expanded: true }).render(120).join("\n");
-  assert.match(firstExpandedProgressLines, /params: single · a · fork/);
-});
-
-test("forkFallback error disables fresh-context retry", async () => {
-  const events = createEvents();
-  const seenContexts: string[] = [];
-  const pi = {
-    events,
-    sendMessage() {},
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { context?: string } };
-    seenContexts.push(request.params.context ?? "");
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: true,
-        errorText: "Failed to create forked subagent session",
-        result: { content: [{ type: "text", text: "fork failed" }] },
-      });
-    }, 0);
-  });
-
-  await assert.rejects(
-    runWorkflow(
-      pi as any,
-      createCtx() as any,
-      {
-        name: "fork-error-test",
-        sourcePath: "fork-error-test.jsonc",
-        agent: "a",
-        task: "t",
-        context: "fork",
-        forkFallback: "error",
-        modelPolicy: "agent",
-      } as any,
-      "",
-    ),
-    /Failed to create forked subagent session/,
-  );
-
-  assert.deepEqual(seenContexts, ["fork"]);
-});
-
-test("workflow list command renders skipped-file warnings", () => withTempHome((home) => {
-  void home;
-  const repo = mkdtempSync(join(tmpdir(), "pi-workflows-list-warning-"));
-  const projectDir = join(repo, ".pi", "workflows");
-  mkdirSync(projectDir, { recursive: true });
-  writeFileSync(join(projectDir, "good.jsonc"), `{ "name": "list-good", "agent": "a", "task": "t" }`);
-  writeFileSync(join(projectDir, "bad.jsonc"), `{ "name": "list-bad", "chain": {} }`);
-
-  const commands = new Map<string, any>();
-  const messages: any[] = [];
-  const pi = {
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-    registerCommand(name: string, command: any) {
-      commands.set(name, command);
-    },
-    on() {},
-  };
-
-  registerPiWorkflows(pi as any);
-  commands.get("workflow").handler("--list", createCtx(repo));
-
-  assert.match(messages[0].content, /\/list-good/);
-  assert.match(messages[0].content, /Skipped invalid workflow file\(s\):/);
-  assert.match(messages[0].content, /bad\.jsonc/);
+  assert.ok(pi.commands.has("workflow"));
+  assert.ok(pi.commands.has("global"));
+  assert.equal(pi.commands.has("local"), false);
+  assert.ok(pi.renderers.has("pi-workflows-progress"));
+  assert.ok(pi.renderers.has("pi-workflows-result"));
 }));
 
-test("project workflow overrides same-named global direct command during execution", async () => withTempHome(async (home) => {
-  const globalDir = join(home, ".pi", "agent", "workflows");
-  mkdirSync(globalDir, { recursive: true });
-  writeFileSync(join(globalDir, "override.jsonc"), `{ "name": "override-test", "agent": "a", "task": "global {{args}}" }`);
+test("workflow list command renders skipped-file warnings", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-list-"));
+  const workflowDir = join(cwd, ".pi", "workflows");
+  writeWorkflow(workflowDir, "good", `{ "name": "good", "agent": "a", "task": "t" }`);
+  writeWorkflow(workflowDir, "bad", `{ "name": "bad", "agent": "a", "task": "t", "context": "fork" }`);
+  const pi = createPi();
+  registerPiWorkflows(pi as any);
+  await pi.commands.get("workflow").handler("--list", createCtx(cwd));
+  assert.match(pi.messages.at(-1).content, /\/good/);
+  assert.match(pi.messages.at(-1).content, /context is not supported/);
+}));
 
-  const repo = mkdtempSync(join(tmpdir(), "pi-workflows-override-"));
-  const projectDir = join(repo, ".pi", "workflows");
-  mkdirSync(projectDir, { recursive: true });
-  writeFileSync(join(projectDir, "override.jsonc"), `{ "name": "override-test", "agent": "a", "task": "project {{args}}" }`);
-
-  const commands = new Map<string, any>();
-  const slashEvents = createEvents();
+test("project workflow overrides a same-named global direct command during execution", async () => withTempHome(async (home) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-direct-"));
+  writeWorkflow(join(home, ".pi", "agent", "workflows"), "review", `{ "name": "review", "agent": "global", "task": "global" }`);
+  writeWorkflow(join(cwd, ".pi", "workflows"), "review", `{ "name": "review", "agent": "project", "task": "project" }`);
+  const pi = createPi();
   const requests: any[] = [];
-  const pi = {
-    events: slashEvents,
-    sendMessage() {},
-    registerCommand(name: string, command: any) {
-      commands.set(name, command);
-    },
-    on() {},
-  };
-
-  slashEvents.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: any };
-    requests.push(request);
-    setTimeout(() => {
-      slashEvents.emit(STARTED_EVENT, { requestId: request.requestId });
-      slashEvents.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "ok" }] },
-      });
-    }, 0);
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    return { text: "ok" };
   });
-
   registerPiWorkflows(pi as any);
-  assert.ok(commands.has("override-test"));
-  await commands.get("override-test").handler("arg", createCtx(repo));
-  assert.equal(requests[0].params.task, "project arg");
+  await pi.commands.get("review").handler("scope", createCtx(cwd));
+  assert.equal(requests[0].agent, "project");
 }));
 
-test("workflow live widget shows pending details without requiring expansion", async () => {
-  const events = createEvents();
-  const widgets: any[] = [];
-  const pi = {
-    events,
-    sendMessage() {},
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus() {},
-      setWidget(_key: string, lines: any) {
-        widgets.push(lines);
-      },
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit("subagent:slash:update", {
-        requestId: request.requestId,
-        toolCount: 2,
-        progress: [{
-          agent: "code-reviewer",
-          status: "running",
-          currentTool: "read",
-          currentToolArgs: "src/index.ts",
-          toolCount: 2,
-          tokens: 1200,
-          durationMs: 1500,
-          recentOutput: ["found issue in parser"],
-          recentTools: [{ tool: "read", args: "src/index.ts" }],
-        }],
-      });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "ok" }], details: { results: [] } },
-      });
-    }, 0);
+test("unreadable project workflow directory refuses fallback to a user workflow", async () => withTempHome(async (home) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-project-warning-"));
+  writeWorkflow(join(home, ".pi", "agent", "workflows"), "review", `{ "name": "review", "agent": "global", "task": "global" }`);
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "workflows"), "not a directory");
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    return { text: "should not run" };
   });
+  registerPiWorkflows(pi as any);
+  await pi.commands.get("workflow").handler("review scope", createCtx(cwd));
+  assert.deepEqual(requests, []);
+  assert.match(pi.messages.at(-1).content, /not run to avoid falling back to a user workflow/);
 
-  await runWorkflow(
-    pi as any,
-    ctx as any,
-    { name: "widget-test", sourcePath: "widget-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-    "",
-  );
+  await pi.commands.get("review").handler("scope", createCtx(cwd));
+  assert.deepEqual(requests, []);
+  assert.match(pi.messages.at(-1).content, /not run to avoid falling back to a user workflow/);
+}));
 
-  const renderedWidgets = widgets.map((widget) => {
-    if (typeof widget === "function") return widget(null, testTheme).render(120);
-    return widget;
-  });
-  const detailedWidget = renderedWidgets.find((lines) => Array.isArray(lines) && lines.some((line: string) => line.includes("found issue in parser")));
-  assert.ok(detailedWidget);
-  assert.match(detailedWidget.join("\n"), /read: src\/index\.ts/);
-  assert.doesNotMatch(detailedWidget.join("\n"), /Ctrl\+O details/);
-});
-
-test("workflow with UI uses live widget instead of persistent progress card", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const widgets: any[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus() {},
-      setWidget(_key: string, widget: any) {
-        widgets.push(widget);
-      },
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit("subagent:slash:update", {
-        requestId: request.requestId,
-        toolCount: 1,
-        progress: [{ agent: "reviewer", status: "running", currentTool: "read", currentToolArgs: "src/index.ts", toolCount: 1 }],
-      });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "final review" }], details: { results: [] } },
-      });
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    ctx as any,
-    { name: "ui-progress-test", sourcePath: "ui-progress-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-    "",
-  );
-
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.equal(messages[0].display, true);
-  assert.ok(widgets.slice(0, -1).some((widget) => typeof widget === "function"));
-  assert.equal(widgets.at(-1), undefined);
-});
-
-test("UI without workflow widget support keeps visible progress cards and status updates", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const widgets: any[] = [];
-  const statuses: any[] = [];
-  let rewriteCount = 0;
-  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-ui-no-widget-session-"));
-  const sessionFile = join(sessionDir, "session.jsonl");
-  const sessionManager = {
-    getSessionFile() {
-      return sessionFile;
-    },
-    _rewriteFile() {
-      rewriteCount += 1;
-    },
-  };
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    sessionManager,
-    ui: {
-      supportsWorkflowWidgets: false,
-      notify() {},
-      setStatus(_key: string, status: any) {
-        statuses.push(status);
-      },
-      setWidget(_key: string, widget: any) {
-        widgets.push(widget);
-      },
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "visible ok" }], details: { results: [] } },
-      });
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    ctx as any,
-    { name: "ui-no-widget-progress", sourcePath: "ui-no-widget-progress.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
-    "",
-  );
-
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
-  assert.deepEqual(messages.map((message) => message.display), [true, true]);
-  assert.equal(widgets.length, 0);
-  assert.ok(statuses.includes("running workflow..."));
-  assert.equal(statuses.at(-1), undefined);
-  assert.equal(rewriteCount, 2);
-  assert.match(messages[1].content, /visible ok/);
-});
-
-test("UI fork without workflow widget support still requires startup persistence", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const widgets: any[] = [];
-  const statuses: any[] = [];
-  let requestCount = 0;
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    ui: {
-      supportsWorkflowWidgets: false,
-      notify() {},
-      setStatus(_key: string, status: any) {
-        statuses.push(status);
-      },
-      setWidget(_key: string, widget: any) {
-        widgets.push(widget);
-      },
-    },
-  };
-  const originalConsoleError = console.error;
-  console.error = () => {};
-  events.on(REQUEST_EVENT, () => {
-    requestCount += 1;
-  });
-
-  try {
-    await assert.rejects(
-      runWorkflow(
-        pi as any,
-        ctx as any,
-        { name: "ui-no-widget-fork-missing-persistence", sourcePath: "ui-no-widget-fork-missing-persistence.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
-        "",
-      ),
-      (error: any) => {
-        assert.equal(error.name, "WorkflowPersistenceError");
-        assert.equal(error.operation, "start");
-        assert.match(error.message, /session file path unavailable/);
-        return true;
-      },
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-
-  assert.equal(requestCount, 0);
-  assert.equal(widgets.length, 0);
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
-  assert.deepEqual(messages.map((message) => message.display), [true, true]);
-  assert.equal(messages[1].details.isError, true);
-  assert.equal(statuses.at(-1), undefined);
-});
-
-test("UI fork fallback creates hidden session-only leaf and uses live widget state", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const entries: any[] = [];
-  const widgets: any[] = [];
-  const rewrites: number[] = [];
-  const seenContexts: string[] = [];
-  const entryCountsAtRequest: number[] = [];
-  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-ui-fork-session-"));
-  const sessionFile = join(sessionDir, "session.jsonl");
-  const sessionManager = {
-    flushed: false,
-    getSessionFile() {
-      return sessionFile;
-    },
-    _rewriteFile() {
-      rewrites.push(messages.length);
-    },
-  };
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-    appendEntry(customType: string, data: any) {
-      entries.push({ customType, data });
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    sessionManager,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus() {},
-      setWidget(_key: string, widget: any) {
-        widgets.push(widget);
-      },
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string; params: { context?: string } };
-    seenContexts.push(request.params.context ?? "");
-    entryCountsAtRequest.push(entries.length);
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      if (seenContexts.length === 1) {
-        events.emit(RESPONSE_EVENT, {
-          requestId: request.requestId,
-          isError: true,
-          errorText: "Failed to create forked subagent session",
-          result: { content: [{ type: "text", text: "fork failed" }] },
-        });
-      } else {
-        events.emit(RESPONSE_EVENT, {
-          requestId: request.requestId,
-          isError: false,
-          result: { content: [{ type: "text", text: "fresh ok" }], details: { results: [] } },
-        });
-      }
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    ctx as any,
-    { name: "ui-fork-test", sourcePath: "ui-fork-test.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
-    "",
-  );
-
-  assert.deepEqual(seenContexts, ["fork", "fresh"]);
-  assert.deepEqual(entryCountsAtRequest, [1, 1]);
-  assert.deepEqual(entries.map((entry) => entry.customType), ["pi-workflows-progress"]);
-  assert.equal(entries[0].data.display, false);
-  assert.equal(entries[0].data.details.status, "starting");
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.equal(messages[0].display, true);
-  assert.equal(messages[0].details.retriedFromFork, true);
-  assert.match(messages[0].content, /fresh ok/);
-  assert.deepEqual(rewrites, [0, 0, 1]);
-  assert.equal(sessionManager.flushed, true);
-  assert.ok(widgets.slice(0, -1).some((widget) => typeof widget === "function"));
-  assert.equal(widgets.at(-1), undefined);
-});
-
-test("UI workflow failure sends final result and clears live widget", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const widgets: any[] = [];
-  const statuses: any[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus(_key: string, status: any) {
-        statuses.push(status);
-      },
-      setWidget(_key: string, widget: any) {
-        widgets.push(widget);
-      },
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: true,
-        errorText: "subagent exploded",
-        result: { content: [{ type: "text", text: "boom" }], details: { results: [] } },
-      });
-    }, 0);
-  });
+test("nested workflow lookup refuses user fallback when project discovery fails", async () => withTempHome(async (home) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-nested-project-warning-"));
+  writeWorkflow(join(home, ".pi", "agent", "workflows"), "child", `{ "name": "child", "agent": "global-child", "task": "global" }`);
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "workflows"), "not a directory");
+  const pi = createPi();
+  respondToRequests(pi, () => ({ text: "should not run" }));
 
   await assert.rejects(
-    runWorkflow(
-      pi as any,
-      ctx as any,
-      { name: "ui-failure-test", sourcePath: "ui-failure-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-      "",
-    ),
-    /subagent exploded/,
+    runWorkflow(pi as any, createCtx(cwd) as any, { name: "parent", sourcePath: "parent.jsonc", chain: [{ workflow: "child" }] } as any, "scope"),
+    /refused because project workflows could not be read/,
   );
-
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.equal(messages[0].display, true);
-  assert.equal(messages[0].details.isError, true);
-  assert.match(messages[0].content, /subagent exploded|boom/);
-  assert.ok(widgets.slice(0, -1).some((widget) => typeof widget === "function"));
-  assert.equal(widgets.at(-1), undefined);
-  assert.equal(statuses.at(-1), undefined);
-});
-
-test("UI fork workflow surfaces session snapshot persistence failures", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const entries: any[] = [];
-  let requestCount = 0;
-  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-ui-persist-fail-"));
-  const sessionFile = join(sessionDir, "session.jsonl");
-  const sessionManager = {
-    getSessionFile() {
-      return sessionFile;
-    },
-    _rewriteFile() {
-      throw new Error("disk full");
-    },
-  };
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-    appendEntry(customType: string, data: any) {
-      entries.push({ customType, data });
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    sessionManager,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus() {},
-      setWidget() {},
-    },
-  };
-  const originalConsoleError = console.error;
-  console.error = () => {};
-  events.on(REQUEST_EVENT, () => {
-    requestCount += 1;
-  });
-
-  try {
-    await assert.rejects(
-      runWorkflow(
-        pi as any,
-        ctx as any,
-        { name: "ui-persist-fail", sourcePath: "ui-persist-fail.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
-        "",
-      ),
-      (error: any) => {
-        assert.equal(error.name, "AggregateError");
-        assert.match(error.message, /failed and failed to report error result/);
-        const errors = error.errors as any[];
-        const startError = errors.find((candidate) => candidate.operation === "start");
-        const reportError = errors.find((candidate) => candidate.operation === "error-result");
-        assert.ok(startError);
-        assert.ok(reportError);
-        assert.match(startError.message, /workflow=\/ui-persist-fail/);
-        assert.match(startError.message, /sessionPath=/);
-        assert.equal(startError.sessionPath, sessionFile);
-        assert.equal(reportError.sessionPath, sessionFile);
-        return true;
-      },
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-
-  assert.equal(requestCount, 0);
-  assert.deepEqual(entries.map((entry) => entry.customType), ["pi-workflows-progress"]);
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.equal(messages[0].display, true);
-  assert.equal(messages[0].details.isError, true);
-  assert.match(messages[0].details.error, /Failed to persist workflow session snapshot/);
-});
-
-test("UI fork workflow fails before dispatch when persistence machinery is unavailable", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const entries: any[] = [];
-  let requestCount = 0;
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-    appendEntry(customType: string, data: any) {
-      entries.push({ customType, data });
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus() {},
-      setWidget() {},
-    },
-  };
-  const originalConsoleError = console.error;
-  console.error = () => {};
-  events.on(REQUEST_EVENT, () => {
-    requestCount += 1;
-  });
-
-  try {
-    await assert.rejects(
-      runWorkflow(
-        pi as any,
-        ctx as any,
-        { name: "ui-missing-persistence", sourcePath: "ui-missing-persistence.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
-        "",
-      ),
-      (error: any) => {
-        assert.equal(error.name, "WorkflowPersistenceError");
-        assert.match(error.message, /operation=start/);
-        assert.match(error.message, /session file path unavailable/);
-        assert.match(error.message, /session rewrite hook unavailable/);
-        return true;
-      },
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-
-  assert.equal(requestCount, 0);
-  assert.deepEqual(entries.map((entry) => entry.customType), ["pi-workflows-progress"]);
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.equal(messages[0].display, true);
-  assert.equal(messages[0].details.isError, true);
-});
-
-test("non-UI fork workflow tolerates startup session snapshot persistence failures", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  let requestCount = 0;
-  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-non-ui-persist-fail-"));
-  const sessionFile = join(sessionDir, "session.jsonl");
-  let rewriteCount = 0;
-  const sessionManager = {
-    getSessionFile() {
-      return sessionFile;
-    },
-    _rewriteFile() {
-      rewriteCount += 1;
-      if (rewriteCount === 1) throw new Error("disk full");
-    },
-  };
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const originalConsoleError = console.error;
-  console.error = () => {};
-
-  events.on(REQUEST_EVENT, (data) => {
-    requestCount += 1;
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "fork ok" }], details: { results: [] } },
-      });
-    }, 0);
-  });
-
-  try {
-    await runWorkflow(
-      pi as any,
-      { ...createCtx(), sessionManager } as any,
-      { name: "non-ui-fork-persist", sourcePath: "non-ui-fork-persist.jsonc", agent: "a", task: "t", context: "fork", modelPolicy: "agent" } as any,
-      "",
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-
-  assert.equal(requestCount, 1);
-  assert.equal(rewriteCount, 2);
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-progress", "pi-workflows-result"]);
-  assert.deepEqual(messages.map((message) => message.display), [true, true]);
-  assert.match(messages[1].content, /fork ok/);
-});
-
-test("workflow with incomplete session persistence still completes after final result and logs degradation", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const diagnostics: string[] = [];
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    sessionManager: {
-      getSessionFile() {
-        return undefined;
-      },
-    },
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus() {},
-      setWidget() {},
-    },
-  };
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "partial persistence ok" }], details: { results: [] } },
-      });
-    }, 0);
-  });
-
-  const originalConsoleError = console.error;
-  console.error = (message?: any) => diagnostics.push(String(message));
-  try {
-    await runWorkflow(
-      pi as any,
-      ctx as any,
-      { name: "partial-persistence", sourcePath: "partial-persistence.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-      "",
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.equal(messages[0].display, true);
-  assert.match(messages[0].content, /partial persistence ok/);
-  assert.ok(diagnostics.some((message) => /Skipped workflow session snapshot persistence/.test(message)));
-});
-
-test("UI workflow surfaces final result persistence failures without failing successful workflow", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const notifications: any[] = [];
-  let requestCount = 0;
-  let rewriteCount = 0;
-  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-final-persist-fail-"));
-  const sessionFile = join(sessionDir, "session.jsonl");
-  const sessionManager = {
-    getSessionFile() {
-      return sessionFile;
-    },
-    _rewriteFile() {
-      rewriteCount += 1;
-      if (rewriteCount === 2) throw new Error("final write failed");
-    },
-  };
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    sessionManager,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify(message: string, level: string) {
-        notifications.push({ message, level });
-      },
-      setStatus() {},
-      setWidget() {},
-    },
-  };
-  const originalConsoleError = console.error;
-  console.error = () => {};
-
-  events.on(REQUEST_EVENT, (data) => {
-    requestCount += 1;
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: { content: [{ type: "text", text: "final ok" }], details: { results: [] } },
-      });
-    }, 0);
-  });
-
-  try {
-    await runWorkflow(
-      pi as any,
-      ctx as any,
-      { name: "final-persist-fail", sourcePath: "final-persist-fail.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-      "",
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-
-  assert.equal(requestCount, 1);
-  assert.equal(rewriteCount, 2);
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.match(messages[0].content, /final ok/);
-  assert.ok(notifications.some((notification) => notification.level === "error" && /operation=result/.test(notification.message)));
-  assert.equal(notifications.some((notification) => notification.level === "success"), false);
-});
-
-test("workflow error plus final result persistence failure is aggregated", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  let rewriteCount = 0;
-  const sessionDir = mkdtempSync(join(tmpdir(), "pi-workflows-error-final-persist-fail-"));
-  const sessionFile = join(sessionDir, "session.jsonl");
-  const sessionManager = {
-    getSessionFile() {
-      return sessionFile;
-    },
-    _rewriteFile() {
-      rewriteCount += 1;
-      if (rewriteCount === 2) throw new Error("final write failed");
-    },
-  };
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-    },
-  };
-  const ctx = {
-    ...createCtx(),
-    hasUI: true,
-    sessionManager,
-    ui: {
-      supportsWorkflowWidgets: true,
-      notify() {},
-      setStatus() {},
-      setWidget() {},
-    },
-  };
-  const originalConsoleError = console.error;
-  console.error = () => {};
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: true,
-        errorText: "subagent failed",
-        result: { content: [{ type: "text", text: "boom" }], details: { results: [] } },
-      });
-    }, 0);
-  });
-
-  try {
-    await assert.rejects(
-      runWorkflow(
-        pi as any,
-        ctx as any,
-        { name: "error-final-persist-fail", sourcePath: "error-final-persist-fail.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-        "",
-      ),
-      (error: any) => {
-        assert.equal(error.name, "AggregateError");
-        assert.match(error.message, /failed and failed to report final result/);
-        assert.ok(error.errors.some((candidate: any) => /subagent failed/.test(candidate.message)));
-        const persistenceError = error.errors.find((candidate: any) => candidate.operation === "result");
-        assert.ok(persistenceError);
-        assert.equal(persistenceError.sessionPath, sessionFile);
-        return true;
-      },
-    );
-  } finally {
-    console.error = originalConsoleError;
-  }
-
-  assert.equal(rewriteCount, 2);
-  assert.deepEqual(messages.map((message) => message.customType), ["pi-workflows-result"]);
-  assert.equal(messages[0].details.isError, true);
-});
-
-test("workflow message renderers expose live progress and expanded agent details", async () => {
-  const events = createEvents();
-  const messages: any[] = [];
-  const renderers = new Map<string, any>();
-  const progressComponents: any[] = [];
-  const longBashCommand = `node scripts/check-rendering.js ${"--flag ".repeat(30)}--important-tail-token`;
-  const synthesizedReview = [
-    "## Summary",
-    "synthesized final review",
-    ...Array.from({ length: 34 }, (_, index) => `- synthesized line ${index + 1}`),
-  ].join("\n");
-  const reviewerNotes = [
-    "### Reviewer Markdown",
-    "- reviewer bullet 1",
-    ...Array.from({ length: 12 }, (_, index) => `- unique reviewer line ${index + 1}`),
-  ].join("\n");
-  const pi = {
-    events,
-    sendMessage(message: any) {
-      messages.push(message);
-      if (message.customType === "pi-workflows-progress") {
-        const renderer = renderers.get("pi-workflows-progress");
-        if (renderer) progressComponents.push(renderer(message, { expanded: true }));
-      }
-    },
-    registerCommand() {},
-    on() {},
-    registerMessageRenderer(type: string, renderer: any) {
-      renderers.set(type, renderer);
-    },
-  };
-
-  registerPiWorkflows(pi as any);
-
-  events.on(REQUEST_EVENT, (data) => {
-    const request = data as { requestId: string };
-    setTimeout(() => {
-      events.emit(STARTED_EVENT, { requestId: request.requestId });
-      events.emit("subagent:slash:update", {
-        requestId: request.requestId,
-        toolCount: 2,
-        progress: [{
-          agent: "code-reviewer",
-          status: "running",
-          currentTool: "read",
-          currentToolArgs: "src/index.ts",
-          toolCount: 2,
-          tokens: 1200,
-          durationMs: 1500,
-          recentOutput: ["found issue in parser"],
-          recentTools: [{ tool: "read", args: "src/index.ts" }],
-        }],
-      });
-      events.emit(RESPONSE_EVENT, {
-        requestId: request.requestId,
-        isError: false,
-        result: {
-          content: [{ type: "text", text: synthesizedReview }],
-          details: {
-            progress: [{
-              agent: "code-reviewer",
-              status: "completed",
-              currentTool: "read",
-              currentToolArgs: "src/index.ts",
-              toolCount: 3,
-              tokens: 1800,
-              durationMs: 2500,
-              recentOutput: ["terminal progress completed"],
-              recentTools: [{ tool: "read", args: "src/index.ts" }, { tool: "bash", args: longBashCommand }],
-            }],
-            results: [{
-              agent: "code-reviewer",
-              exitCode: 0,
-              finalOutput: reviewerNotes,
-              sessionFile: "/tmp/child-session.jsonl",
-              savedOutputPath: "/tmp/saved-review.md",
-              artifactPaths: {
-                inputPath: "/tmp/reviewer-input.json",
-                outputPath: "/tmp/reviewer-output.md",
-                jsonlPath: "/tmp/reviewer-events.jsonl",
-                metadataPath: "/tmp/reviewer-metadata.json",
-              },
-            }, {
-              agent: "review-synthesizer",
-              exitCode: 0,
-              finalOutput: synthesizedReview,
-            }],
-          },
-        },
-      });
-    }, 0);
-  });
-
-  await runWorkflow(
-    pi as any,
-    createCtx() as any,
-    { name: "render-test", sourcePath: "render-test.jsonc", agent: "a", task: "t", modelPolicy: "agent" } as any,
-    "",
-  );
-
-  const progressRenderer = renderers.get("pi-workflows-progress");
-  const resultRenderer = renderers.get("pi-workflows-result");
-  assert.ok(progressRenderer);
-  assert.ok(resultRenderer);
-
-  const progressMessage = messages.find((message) => message.customType === "pi-workflows-progress");
-  const progressLines = progressRenderer(progressMessage, { expanded: true }).render(120).join("\n");
-  assert.match(progressLines, /workflow \/render-test/);
-  assert.match(progressLines, /✓ code-reviewer: completed/);
-  assert.match(progressLines, /read: src\/index\.ts/);
-  assert.match(progressLines, /terminal progress completed/);
-  assert.match(progressLines, /important-tail-token/);
-  assert.doesNotMatch(progressLines, /code-reviewer: running/);
-  assert.equal(progressComponents.length, 1);
-  const liveComponentLines = progressComponents[0].render(120).join("\n");
-  assert.match(liveComponentLines, /✓ code-reviewer: completed/);
-  assert.match(liveComponentLines, /terminal progress completed/);
-
-  const resultMessage = messages.find((message) => message.customType === "pi-workflows-result");
-  const collapsedLines = resultRenderer(resultMessage, { expanded: false }).render(120).join("\n");
-  assert.match(collapsedLines, /synthesized final review/);
-  assert.match(collapsedLines, /synthesized line 34/);
-  assert.match(collapsedLines, /Ctrl\+O for 2 agent details/);
-  assert.doesNotMatch(collapsedLines, /Agent details/);
-  assert.doesNotMatch(collapsedLines, /Reviewer Markdown/);
-  const narrowCollapsedLines = resultRenderer(resultMessage, { expanded: false }).render(48).join("\n");
-  assert.match(narrowCollapsedLines, /synthesized line 34/);
-  assert.doesNotMatch(narrowCollapsedLines, /more visual lines/);
-  const rerenderedCollapsedLines = resultRenderer(resultMessage, { expanded: false }).render(120).join("\n");
-  assert.match(rerenderedCollapsedLines, /synthesized line 34/);
-  const expandedLines = resultRenderer(resultMessage, { expanded: true }).render(120).join("\n");
-  assert.match(expandedLines, /Agent details/);
-  assert.match(expandedLines, /synthesized line 34/);
-  assert.match(expandedLines, /Reviewer Markdown/);
-  assert.match(expandedLines, /unique reviewer line 12/);
-  assert.match(expandedLines, /session: \/tmp\/child-session\.jsonl/);
-  assert.match(expandedLines, /saved output: \/tmp\/saved-review\.md/);
-  assert.match(expandedLines, /artifact input: \/tmp\/reviewer-input\.json/);
-  assert.match(expandedLines, /artifact output: \/tmp\/reviewer-output\.md/);
-  assert.match(expandedLines, /artifact jsonl: \/tmp\/reviewer-events\.jsonl/);
-  assert.match(expandedLines, /artifact metadata: \/tmp\/reviewer-metadata\.json/);
-  assert.match(expandedLines, /✓ code-reviewer: completed/);
-  assert.doesNotMatch(expandedLines, /code-reviewer: running/);
-});
-
-test("session cwd discovery does not register repo-local direct commands", () => withTempHome((home) => {
-  const globalDir = join(home, ".pi", "agent", "workflows");
-  mkdirSync(globalDir, { recursive: true });
-  writeFileSync(join(globalDir, "global.jsonc"), `{ "name": "global-direct-test", "description": "global", "agent": "a", "task": "t" }`);
-
-  const repoA = mkdtempSync(join(tmpdir(), "pi-workflows-cwd-a-"));
-  const repoAWorkflowDir = join(repoA, ".pi", "workflows");
-  mkdirSync(repoAWorkflowDir, { recursive: true });
-  writeFileSync(join(repoAWorkflowDir, "local.jsonc"), `{ "name": "repo-only-test", "description": "local", "agent": "a", "task": "t" }`);
-
-  const repoB = mkdtempSync(join(tmpdir(), "pi-workflows-cwd-b-"));
-  const commands = new Map<string, any>();
-  const events = new Map<string, (...args: any[]) => void>();
-  const pi = {
-    registerCommand(name: string, command: any) {
-      commands.set(name, command);
-    },
-    on(event: string, handler: (...args: any[]) => void) {
-      events.set(event, handler);
-    },
-  };
-
-  registerPiWorkflows(pi as any);
-  assert.ok(commands.has("global-direct-test"));
-
-  events.get("session_start")?.({}, createCtx(repoA));
-  assert.equal(commands.has("repo-only-test"), false);
-  const completions = commands.get("workflow").getArgumentCompletions("repo");
-  assert.ok(completions.some((completion: any) => completion.value === "repo-only-test"));
-
-  events.get("session_start")?.({}, createCtx(repoB));
-  assert.equal(commands.has("repo-only-test"), false);
 }));
+
+test("workflow result renderer shows compact params without removed context details", async () => withTempHome(async () => {
+  const pi = createPi();
+  respondToRequests(pi, () => ({ text: "final output" }));
+  registerPiWorkflows(pi as any);
+  await runWorkflow(pi as any, createCtx() as any, { name: "render", sourcePath: "render.jsonc", agent: "reviewer", task: "Review" } as any, "scope");
+
+  const resultMessage = pi.messages.find((message) => message.customType === "pi-workflows-result");
+  const renderer = pi.renderers.get("pi-workflows-result");
+  const rendered = renderer(resultMessage, { expanded: true }).render(120).join("\n");
+  assert.match(rendered, /workflow \/render completed/);
+  assert.match(rendered, /params: single · reviewer/);
+  assert.match(rendered, /final output/);
+  assert.doesNotMatch(rendered, /fork|fresh|worktree|agentScope/);
+}));
+
+test("splitArgs preserves quoted positional arguments", () => {
+  assert.deepEqual(splitArgs('one "two words" --flag \'three four\''), ["one", "two words", "--flag", "three four"]);
+});

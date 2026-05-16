@@ -1,14 +1,8 @@
 # pi-workflows
 
-Named slash-command workflows for launching [`pi-subagents`](https://github.com/nicobailon/pi-subagents) chains.
+Named slash-command workflows for launching [`pi-subagents`](https://github.com/nicobailon/pi-subagents) agents and simple workflow compositions.
 
-The default policy is **agent-owned models**: workflow files describe orchestration, while each subagent file owns its `model`, `thinking`, tools, and role prompt.
-
-## Why
-
-Prompt templates are convenient for `/review-agents`, `/review-deep`, etc., but model-enabled prompt templates resolve a model before delegation and pass it as a subagent override. That makes the template own the model.
-
-`pi-workflows` keeps the easy slash-command UX while launching `pi-subagents` directly. Unless a workflow explicitly opts out, model overrides are rejected.
+`pi-workflows` intentionally keeps the workflow surface small: define named workflows, run agents in sequence or parallel, optionally call another workflow, and let `pi-subagents` use its default execution context.
 
 ## Install
 
@@ -22,7 +16,7 @@ Restart Pi or run `/reload`.
 
 ## Where workflows live
 
-Workflows are intentionally **not bundled as active commands** in this extension. The extension only provides the launcher. Put workflow files in:
+Workflows are JSON/JSONC files ending in `.json` or `.jsonc`.
 
 | Scope | Directory |
 |---|---|
@@ -31,37 +25,14 @@ Workflows are intentionally **not bundled as active commands** in this extension
 
 Project workflows override global workflows with the same `name`.
 
-Direct slash commands are registered for global/user workflows at startup/reload and again when a session starts. Project-local workflows are intentionally discovered through `/workflow <name> ...` (and `/workflow --list`) so repo-local aliases do not leak into unrelated repos for the rest of the Pi process. If a project workflow has the same `name` as a global direct command, the project workflow still overrides it when that direct command is invoked from the project cwd.
-
-## Examples
-
-Example workflows and agents live under `examples/` only:
-
-```text
-examples/workflows/review-agents.jsonc
-examples/workflows/review-deep.jsonc
-examples/workflows/oracle-review.jsonc
-examples/workflows/quality-sweep.jsonc
-examples/agents/review-synthesizer.md
-examples/agents/skill-delegate.md
-```
-
-Install all examples globally:
-
-```bash
-./scripts/install-review-examples.sh
-```
-
-Then reload Pi.
+Direct slash commands are registered for global/user workflows. Project workflows are discovered through `/workflow <name> ...` and also override a same-named global command when that command is invoked from the project cwd.
 
 ## Usage
-
-After installing workflows into `~/.pi/agent/workflows` or `.pi/workflows`:
 
 ```text
 /review-agents current git diff
 /review-deep changes since main
-/oracle-review current plan before implementation
+/quality-sweep current branch
 ```
 
 Generic runner:
@@ -71,32 +42,18 @@ Generic runner:
 /workflow --list
 ```
 
-While a workflow runs in the TUI, `pi-workflows` shows a single compact live widget with active agents, tool counts, current tools, and token/duration stats. When the workflow completes, it renders the final successful subagent output back into the conversation as an expandable result card instead of only showing the `pi-subagents` chain summary. Press **Ctrl+O** on the final card to show per-agent progress, recent tools/output, child session paths, saved outputs, and artifact paths. If the underlying subagent run fails, it renders failure text and propagates the failure instead of showing a stale successful step output.
+Workflow arguments are passed through as normal task text. There are no runtime context/worktree flags; values like `--fork` or `--worktree` are treated as ordinary arguments.
 
-Runtime flags:
-
-```text
-/review-agents --fork current diff       # force forked context when parent session forking is available
-/review-agents --fresh current diff      # force fresh context
-/review-agents --bg current diff         # background/async
-/review-agents --clarify current diff    # open subagent clarify UI
-/review-agents --worktree current diff   # worktree isolation where supported
-/review-agents --cwd=/path/to/repo ...
-/review-agents --agent-scope=project ...
-```
+While a workflow runs in the TUI, `pi-workflows` shows a compact live widget with current agents/tools when Pi's widget surface is available. Final result cards can be expanded with Pi's normal message expansion keybinding to inspect per-agent output and failures.
 
 ## Workflow format
 
-Workflows are JSON/JSONC files ending in `.json` or `.jsonc`.
+Minimal multi-agent review workflow:
 
 ```jsonc
 {
   "name": "review-agents",
   "description": "Multi-agent code review",
-  "modelPolicy": "agent",
-  "context": "fresh",
-  "clarify": false,
-  "agentScope": "both",
   "chain": [
     {
       "parallel": [
@@ -113,41 +70,51 @@ Workflows are JSON/JSONC files ending in `.json` or `.jsonc`.
     },
     {
       "agent": "review-synthesizer",
-      "task": "Synthesize these outputs: {{previous}}"
+      "task": "Synthesize these outputs:\n\n{{previous}}"
     }
   ]
 }
 ```
 
-Supported top-level execution fields:
+Supported top-level fields:
 
-- `chain` — sequential chain with optional `{ "parallel": [...] }` steps. Chain entries can be agent runnables or workflow runnables.
-- `tasks` — top-level parallel task list for agent runnables.
-- `agent` + `task` — single subagent task.
-- `defaultAgent` — default agent for `chain` steps, nested parallel tasks, and top-level `tasks` entries that omit `agent`. Individual entries can still set `agent` to override it.
-- `skill` — non-empty skill name, comma-separated skill names, non-empty skill-name array, or `false`. For chains this is additive; for top-level parallel tasks it is applied to each task unless that task sets `skill: false`.
-- `skills` — alias for `skill`, intended for arrays. Do not define both `skill` and `skills` in the same workflow or step. If included, it must contain at least one non-empty skill name.
-- `context` — `"fresh"` or `"fork"`.
-- `clarify` — boolean.
-- `async` — boolean.
-- `worktree` — boolean.
-- `cwd` — string.
-- `chainDir` — string.
-- `agentScope` — `"user"`, `"project"`, or `"both"`.
-- `model` — single-task model override. Rejected unless `modelPolicy` is `"workflow"`.
-- `modelPolicy` — `"agent"` by default. Set `"workflow"` only if you intentionally want workflow-level model overrides.
-- `forkFallback` — `"fresh"` by default. If `context: "fork"` fails because Pi cannot create a forked subagent session, retry once with fresh context. Set `"error"` to fail instead.
+- `name` — required workflow/command name.
+- `description` — optional text shown in command help and `/workflow --list`.
+- `defaultAgent` — optional default agent for agent runnables that omit `agent`.
+- `skill` / `skills` — optional workflow-level skill injection/default.
+- Exactly one execution shape:
+  - `agent` + `task` — single-agent workflow.
+  - `tasks` — top-level parallel agent tasks.
+  - `chain` — sequential workflow steps.
 
-Step and task entries may also set `skill`/`skills`; step-level `skill: false` disables a top-level skill default for that task. Unknown workflow, step, or task fields are rejected so typos such as `agnet` do not silently fall back to defaults.
+Agent runnable fields:
 
-Workflow runnables let a parent workflow run named workflows alongside normal agent steps. They use the existing workflow discovery precedence, and the parent workflow/runtime flags control the composed run. In v1, nested workflow runnables accept only `workflow` and optional `args`; they do not accept per-child `context`, `cwd`, `agentScope`, `clarify`, `async`, or `worktree` overrides. Only one nested workflow level is supported.
+- `agent` — agent name; optional only when `defaultAgent` is set.
+- `task` — task template.
+- `model` — optional explicit model override. If omitted, the agent's own configured model is used.
+- `skill` / `skills` — optional per-runnable skill override/addition. `skill: false` disables a workflow-level skill default for that runnable.
 
-Example mixed workflow composition:
+Workflow runnable fields:
+
+- `workflow` — named workflow to run.
+- `args` — optional argument template; defaults to the current `{{args}}`.
+
+Parallel step fields:
+
+- `parallel` — non-empty array of agent or workflow runnables.
+- `failFast` — optional boolean. Default is `true`, which stops the chain after a failed parallel group. Set `false` to collect failed child output and continue to later synthesis steps.
+
+Unknown workflow, step, or task fields are rejected so typos and removed legacy options fail loudly.
+
+Removed fields include `context`, `forkFallback`, `worktree`, `cwd`, `chainDir`, `agentScope`, `clarify`, `async`, `output`, `reads`, `progress`, `count`, and `modelPolicy`.
+
+## Nested workflow composition
+
+A workflow can execute other workflows alongside normal agents:
 
 ```jsonc
 {
   "name": "quality-sweep",
-  "context": "fresh",
   "chain": [
     {
       "parallel": [
@@ -156,119 +123,54 @@ Example mixed workflow composition:
         {
           "agent": "skill-delegate",
           "skills": ["security-review"],
-          "task": "Run security review for:\n\n{{args}}"
+          "task": "Run a focused security review for:\n\n{{args}}"
         }
       ],
       "failFast": false
     },
     {
       "agent": "review-synthesizer",
-      "task": "Synthesize these review streams into one prioritized report:\n\n{{previous}}"
+      "task": "Synthesize these review streams:\n\n{{previous}}"
     }
   ]
 }
 ```
 
-When a mixed parallel group uses `failFast: false`, failed child workflow/agent text is included in the aggregate so the synthesizer can still produce a useful report.
+Nested workflow execution is deliberately simple: child workflows receive rendered `args` and otherwise use the same default `pi-subagents` behavior as any other workflow.
 
-Example skill-driven single-agent workflow:
+## Template variables
 
-```jsonc
-{
-  "name": "access-risk",
-  "agent": "skill-delegate",
-  "skills": ["behavior-risk-access-contracts"],
-  "task": "Run the injected behavior-risk skill for this scope:\n\n{{args}}"
-}
-```
+Supported in task and nested-workflow `args` strings:
 
-The `examples/agents/skill-delegate.md` agent is intentionally generic: it does not inherit the full skills catalog, but it will follow any specific skills injected by a workflow-level or task-level `skill`/`skills` field.
-
-For multi-step skill workflows, set `defaultAgent` once and override only the exceptional entries:
-
-```jsonc
-{
-  "name": "skill-sweep",
-  "defaultAgent": "skill-delegate",
-  "skills": ["behavior-risk-access-contracts"],
-  "tasks": [
-    { "task": "Review authentication changes: {{args}}" },
-    { "agent": "review-synthesizer", "task": "Summarize any risk findings for: {{args}}" }
-  ]
-}
-```
-
-Supported template variables in task strings:
-
-- `{{args}}` or `{{$@}}` — full slash-command args after runtime flags are removed.
+- `{{args}}` or `{{$@}}` — full slash-command args.
 - `{{1}}`, `{{2}}`, ... — positional args with simple shell-style quoting.
 - `{{cwd}}` — invocation cwd.
-- `{{previous}}` — converted to `pi-subagents` `{previous}` in simple workflows, or replaced with the actual prior aggregate text in mixed workflow compositions.
-- `{{task}}` — converted to `{task}`.
-- `{{chain_dir}}` — converted to `{chain_dir}`.
+- `{{previous}}` — previous step/parallel output in composed workflows, or `{previous}` when delegated directly to `pi-subagents`.
+- `{{task}}` — original task placeholder for direct `pi-subagents` delegation.
 
-## Context mode
+## Examples
 
-For code-review workflows, `context: "fresh"` is usually the safest default: reviewers can inspect the repository directly, and the workflow does not depend on Pi being able to fork the current conversation session.
-
-Use `context: "fork"` when the workflow genuinely needs the parent conversation history. Pi's forked subagent context requires a persisted parent session and a leaf entry that exists in the session file. In UI sessions, `pi-workflows` creates or persists a startup entry before dispatching forked workflows; if that entry cannot be persisted, the workflow fails before launch rather than silently losing parent history. If fork creation is unavailable after that, `pi-workflows` retries once with `context: "fresh"` by default and includes a note in the result. Non-required workflow persistence is best-effort: if session persistence machinery is unavailable for non-fork/final-result paths, the workflow continues and logs a diagnostic instead of turning successful work into a failure. To make fork failures hard errors, set:
-
-```jsonc
-{ "forkFallback": "error" }
-```
-
-## Oracle workflows
-
-`oracle-review` is a high-context decision-consistency review workflow. Use it when you want a forked advisory pass over the current conversation, plan, or implementation direction before committing to the next step:
+Example workflows and agents live under `examples/` only:
 
 ```text
-/oracle-review current plan before implementation
-/workflow oracle-review check for drift before I implement the migration
+examples/workflows/review-agents.jsonc
+examples/workflows/review-deep.jsonc
+examples/workflows/quality-sweep.jsonc
+examples/workflows/oracle-review.jsonc
+examples/agents/review-synthesizer.md
+examples/agents/skill-delegate.md
 ```
 
-Oracle workflows should usually keep:
+Install all examples globally:
 
-```jsonc
-{
-  "context": "fork",
-  "forkFallback": "error"
-}
+```bash
+./scripts/install-review-examples.sh
 ```
 
-Unlike normal code-review workflows, `oracle` needs the inherited parent-session context to reconstruct decisions, constraints, and open questions. If forked context is unavailable, failing loudly is safer than silently retrying with fresh context.
-
-Do not treat `oracle` as a generic diff reviewer, and do not automatically chain `oracle` into `oracle-executor`. The intended loop is: Oracle advises, the main agent/user approves a direction, and only then an executor implements the approved direction.
-
-## Model ownership
-
-By default, this is valid and uses the agent's configured model:
-
-```jsonc
-{ "agent": "code-reviewer", "task": "Review {{args}}" }
-```
-
-This is rejected by default:
-
-```jsonc
-{ "agent": "code-reviewer", "model": "anthropic/claude-opus-4-5", "task": "Review {{args}}" }
-```
-
-To allow workflow-owned models, set:
-
-```jsonc
-{
-  "modelPolicy": "workflow",
-  "agent": "code-reviewer",
-  "model": "anthropic/claude-opus-4-5",
-  "task": "Review {{args}}"
-}
-```
-
-## Invalid workflow files
-
-Workflow discovery is fault-tolerant: one malformed JSON/JSONC file is skipped with a warning that includes the file path and parse/validation message, while other valid workflows continue to load. `/workflow --list` includes skipped-file warnings when discovery finds invalid files.
+Then reload Pi.
 
 ## Notes
 
-* This extension currently launches workflows through the `pi-subagents` slash bridge event protocol, so `pi-subagents` must be loaded in the same Pi session.
-* The extension draws a lot of inspiration from [pi-prompt-template-model](https://github.com/nicobailon/pi-prompt-template-model)
+- Workflows run through the `pi-subagents` slash bridge event protocol, so `pi-subagents` must be loaded in the same Pi session.
+- This project intentionally omits worktree and context-management controls. If you need a separate context, use Pi's normal terminal/window/session controls.
+- CI/GitHub Actions should use the default synchronous behavior; background/async workflow execution is not part of this reduced API.

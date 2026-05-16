@@ -1,10 +1,6 @@
 {
   "name": "quality-sweep",
   "description": "Run included review workflows plus a delegated security review, then synthesize",
-  "modelPolicy": "agent",
-  "context": "fresh",
-  "clarify": false,
-  "agentScope": "both",
   "chain": [
     {
       "parallel": [

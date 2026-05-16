@@ -1,10 +1,6 @@
 {
   "name": "review-agents",
   "description": "Multi-agent code review using skeptical, guideline, test, and error-handling agents",
-  "modelPolicy": "agent",
-  "context": "fresh",
-  "clarify": false,
-  "agentScope": "both",
   "chain": [
     {
       "parallel": [

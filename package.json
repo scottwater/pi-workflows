@@ -1,7 +1,7 @@
 {
   "name": "pi-workflows",
   "version": "0.1.0",
-  "description": "Named slash-command workflows for launching pi-subagents chains with agent-owned models by default.",
+  "description": "Named slash-command workflows for launching pi-subagents agents and simple workflow compositions.",
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.ts"

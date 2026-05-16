@@ -1,10 +1,6 @@
 {
   "name": "review-deep",
   "description": "Deep multi-agent code review with comments and type-design analysis",
-  "modelPolicy": "agent",
-  "context": "fresh",
-  "clarify": false,
-  "agentScope": "both",
   "chain": [
     {
       "parallel": [
