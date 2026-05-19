@@ -167,6 +167,12 @@ Install all examples globally:
 ./scripts/install-review-examples.sh
 ```
 
+Or install only the example agents:
+
+```bash
+./scripts/install-example-agents.sh
+```
+
 Then reload Pi.
 
 ## Notes
