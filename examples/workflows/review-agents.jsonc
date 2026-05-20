@@ -1,6 +1,7 @@
 {
   "name": "review-agents",
   "description": "Multi-agent code review using skeptical, guideline, test, and error-handling agents",
+  "readOnly": true,
   "chain": [
     {
       "parallel": [

@@ -1,6 +1,7 @@
 {
   "name": "quality-sweep",
   "description": "Run included review workflows plus a delegated security review, then synthesize",
+  "readOnly": true,
   "chain": [
     {
       "parallel": [

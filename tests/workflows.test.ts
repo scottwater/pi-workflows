@@ -17,6 +17,7 @@ const REQUEST_EVENT = "subagent:slash:request";
 const STARTED_EVENT = "subagent:slash:started";
 const RESPONSE_EVENT = "subagent:slash:response";
 const CANCEL_EVENT = "subagent:slash:cancel";
+const READ_ONLY_PREFIX = "Review only. Do not edit files; return findings/analysis only.\n\n";
 
 type Listener = (data: unknown) => void;
 
@@ -213,6 +214,10 @@ test("workflow schema allows model overrides and rejects removed fields", () => 
     ["step-output.jsonc", `{ "name": "bad", "chain": [{ "agent": "a", "task": "t", "output": "x" }] }`, /output is not supported/],
     ["count.jsonc", `{ "name": "bad", "chain": [{ "parallel": [{ "agent": "a", "task": "t", "count": 2 }] }] }`, /count is not supported/],
     ["worktree.jsonc", `{ "name": "bad", "chain": [{ "parallel": [{ "agent": "a", "task": "t" }], "worktree": true }] }`, /worktree is not supported/],
+    ["read-only-string.jsonc", `{ "name": "bad", "readOnly": "true", "agent": "a", "task": "t" }`, /readOnly must be a boolean/],
+    ["read-only-number.jsonc", `{ "name": "bad", "readOnly": 1, "agent": "a", "task": "t" }`, /readOnly must be a boolean/],
+    ["read-only-object.jsonc", `{ "name": "bad", "readOnly": {}, "agent": "a", "task": "t" }`, /readOnly must be a boolean/],
+    ["task-read-only-string.jsonc", `{ "name": "bad", "tasks": [{ "agent": "a", "task": "t", "readOnly": "true" }] }`, /readOnly must be a boolean/],
   ] as const) {
     const path = join(dir, file);
     writeFileSync(path, body);
@@ -227,11 +232,12 @@ test("workflow defaultAgent, skills, model, and failFast are parsed into subagen
     "name": "params",
     "defaultAgent": "skill-delegate",
     "skills": ["security-review"],
+    "readOnly": true,
     "chain": [
       { "task": "first {{1}} {{args}}", "model": "m1" },
       { "parallel": [
         { "task": "parallel", "model": "m2" },
-        { "agent": "custom", "task": "custom", "skills": ["docs"] }
+        { "agent": "custom", "task": "custom", "skills": ["docs"], "readOnly": false }
       ], "failFast": false }
     ]
   }`);
@@ -239,30 +245,103 @@ test("workflow defaultAgent, skills, model, and failFast are parsed into subagen
   assert.deepEqual(params.skill, ["security-review"]);
   assert.equal((params.chain?.[0] as any).agent, "skill-delegate");
   assert.equal((params.chain?.[0] as any).model, "m1");
-  assert.equal((params.chain?.[0] as any).task, 'first two words "two words" rest');
+  assert.equal((params.chain?.[0] as any).task, `${READ_ONLY_PREFIX}first two words "two words" rest`);
   assert.equal((params.chain?.[1] as any).failFast, false);
   assert.equal((params.chain?.[1] as any).parallel[0].model, "m2");
   assert.equal((params.chain?.[1] as any).parallel[1].agent, "custom");
+  assert.equal((params.chain?.[1] as any).parallel[1].task, "custom");
+  assert.equal((params.chain?.[1] as any).parallel[0].readOnly, undefined);
   for (const removed of ["context", "worktree", "cwd", "chainDir", "agentScope", "clarify", "async", "output", "reads", "progress"]) {
     assert.equal((params as any)[removed], undefined);
   }
 });
 
-test("top-level tasks receive workflow skill defaults without unsupported params", () => {
+test("top-level tasks receive workflow skill and readOnly defaults without unsupported params", () => {
   const workflow = {
     name: "tasks",
     sourcePath: "tasks.jsonc",
     skill: ["security"],
+    readOnly: true,
     tasks: [
       { agent: "a", task: "A {{args}}" },
-      { agent: "b", task: "B", skill: false },
+      { agent: "b", task: "B", skill: false, readOnly: false },
+      { agent: "c" },
     ],
   };
   const params = buildSubagentParams(workflow as any, "scope", { args: "scope", positional: ["scope"] }, createCtx() as any);
-  assert.deepEqual(params.tasks?.[0].skill, ["security"]);
-  assert.equal(params.tasks?.[1].skill, false);
-  assert.equal(params.tasks?.[0].task, "A scope");
+  const taskA = params.tasks?.find((task) => task.agent === "a") as any;
+  const taskB = params.tasks?.find((task) => task.agent === "b") as any;
+  const taskC = params.tasks?.find((task) => task.agent === "c") as any;
+  assert.deepEqual(taskA.skill, ["security"]);
+  assert.equal(taskB.skill, false);
+  assert.equal(taskA.task, `${READ_ONLY_PREFIX}A scope`);
+  assert.equal(taskB.task, "B");
+  assert.equal(taskC.task, `${READ_ONLY_PREFIX}scope`);
+  assert.equal(taskA.readOnly, undefined);
+  assert.equal(taskC.readOnly, undefined);
   assert.equal((params as any).agentScope, undefined);
+});
+
+test("single-agent workflows apply readOnly prefix using only the authored task for idempotence", () => {
+  const workflow = {
+    name: "single",
+    sourcePath: "single.jsonc",
+    readOnly: true,
+    agent: "reviewer",
+    task: "Summarize {{args}}",
+  };
+  const params = buildSubagentParams(workflow as any, "do not edit this sentence", { args: "do not edit this sentence", positional: ["do", "not", "edit", "this", "sentence"] }, createCtx() as any);
+  assert.equal(params.agent, "reviewer");
+  assert.equal(params.task, `${READ_ONLY_PREFIX}Summarize do not edit this sentence`);
+});
+
+test("readOnly agent runnables can opt in without workflow-level readOnly", () => {
+  const workflow = {
+    name: "tasks",
+    sourcePath: "tasks.jsonc",
+    tasks: [
+      { agent: "a", task: "A", readOnly: true },
+      { agent: "b", task: "B" },
+    ],
+  };
+  const params = buildSubagentParams(workflow as any, "scope", { args: "scope", positional: ["scope"] }, createCtx() as any);
+  assert.equal(params.tasks?.[0].task, `${READ_ONLY_PREFIX}A`);
+  assert.equal(params.tasks?.[1].task, "B");
+  assert.equal((params.tasks?.[0] as any).readOnly, undefined);
+});
+
+test("readOnly native chains prefix omitted step fallback tasks", () => {
+  const workflow = {
+    name: "native-defaults",
+    sourcePath: "native-defaults.jsonc",
+    readOnly: true,
+    chain: [
+      { agent: "first" },
+      { agent: "second" },
+      { parallel: [{ agent: "third" }, { agent: "fourth", readOnly: false }], failFast: true },
+    ],
+  };
+  const params = buildSubagentParams(workflow as any, "scope", { args: "scope", positional: ["scope"] }, createCtx() as any);
+  assert.equal((params.chain?.[0] as any).agent, "first");
+  assert.equal((params.chain?.[0] as any).task, `${READ_ONLY_PREFIX}scope`);
+  assert.equal((params.chain?.[1] as any).agent, "second");
+  assert.equal((params.chain?.[1] as any).task, `${READ_ONLY_PREFIX}{previous}`);
+  assert.equal((params.chain?.[2] as any).parallel[0].agent, "third");
+  assert.equal((params.chain?.[2] as any).parallel[0].task, `${READ_ONLY_PREFIX}{previous}`);
+  assert.equal((params.chain?.[2] as any).parallel[1].agent, "fourth");
+  assert.equal((params.chain?.[2] as any).parallel[1].task, "{previous}");
+});
+
+test("authored canonical readOnly prefix is not duplicated", () => {
+  const workflow = {
+    name: "already-prefixed",
+    sourcePath: "already-prefixed.jsonc",
+    readOnly: true,
+    agent: "reviewer",
+    task: `${READ_ONLY_PREFIX}Review {{args}}`,
+  };
+  const params = buildSubagentParams(workflow as any, "scope", { args: "scope", positional: ["scope"] }, createCtx() as any);
+  assert.equal(params.task, `${READ_ONLY_PREFIX}Review scope`);
 });
 
 test("nested workflow runnables are kept for the composite runner, not emitted to pi-subagents", () => {
@@ -427,6 +506,37 @@ test("UI side-effect failures do not mask workflow success", async () => withTem
   }
 }));
 
+test("readOnly composite chains prefix synthesis tasks even when previous output recommends fixes", async () => withTempHome(async () => {
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    if (params.agent === "audit") return { text: "Do not edit public API. Recommended fix: Add request specs and update code." };
+    if (params.agent === "implementation-advisor") return { text: "advisor output" };
+    return { text: `synth saw:\n${params.task}` };
+  });
+
+  await runWorkflow(pi as any, createCtx() as any, {
+    name: "read-only-audit",
+    sourcePath: "read-only-audit.jsonc",
+    readOnly: true,
+    chain: [
+      { parallel: [
+        { agent: "audit", task: "Audit scope" },
+        { agent: "implementation-advisor", task: "Suggest edits", readOnly: false },
+      ], failFast: false },
+      { agent: "synth", task: "Synthesize:\n{{previous}}" },
+    ],
+  } as any, "scope");
+
+  assert.deepEqual(requests.map((request) => request.agent), ["audit", "implementation-advisor", "synth"]);
+  assert.match(requests[0].task, /^Review only\. Do not edit files;/);
+  assert.equal(requests[1].task, "Suggest edits");
+  assert.match(requests[2].task, /^Review only\. Do not edit files;/);
+  assert.match(requests[2].task, /Recommended fix: Add request specs/);
+  assert.equal((requests[2] as any).readOnly, undefined);
+}));
+
 test("plain chain failFast false continues to synthesis after a parallel child failure", async () => withTempHome(async () => {
   const pi = createPi();
   const requests: any[] = [];
@@ -544,6 +654,38 @@ test("nested workflows and agents compose with failFast false", async () => with
   const result = pi.messages.find((message) => message.customType === "pi-workflows-result");
   assert.equal(result.details.isError, true, "partial failures are visible in result details");
   assert.match(result.content, /synth saw/);
+}));
+
+test("parent readOnly applies transitively to nested workflows", async () => withTempHome(async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-nested-read-only-"));
+  writeWorkflow(join(cwd, ".pi", "workflows"), "child-review", `{
+    "name": "child-review",
+    "readOnly": false,
+    "chain": [
+      { "agent": "child-a", "task": "child {{args}}", "readOnly": false },
+      { "agent": "child-b" }
+    ]
+  }`);
+  const pi = createPi();
+  const requests: any[] = [];
+  respondToRequests(pi, (params) => {
+    requests.push(params);
+    return { text: `${params.agent}: ${params.task}` };
+  });
+
+  await runWorkflow(pi as any, createCtx(cwd) as any, {
+    name: "parent",
+    sourcePath: "parent.jsonc",
+    readOnly: true,
+    chain: [{ workflow: "child-review", args: "nested {{args}}" }],
+  } as any, "scope");
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].agent, undefined);
+  assert.equal(requests[0].chain[0].agent, "child-a");
+  assert.equal(requests[0].chain[0].task, `${READ_ONLY_PREFIX}child nested scope`);
+  assert.equal(requests[0].chain[1].agent, "child-b");
+  assert.equal(requests[0].chain[1].task, `${READ_ONLY_PREFIX}{previous}`);
 }));
 
 test("nested workflows abort before later chain steps when failFast is true", async () => withTempHome(async () => {

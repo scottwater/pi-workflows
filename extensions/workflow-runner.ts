@@ -85,10 +85,38 @@ function stripUndefined<T extends Record<string, unknown>>(value: T): T {
   return value;
 }
 
-function renderAgentRunnable(step: AgentRunnable, rawArgs: string, ctx: ExtensionCommandContext, positional?: string[]): AgentRunnable {
+const READ_ONLY_TASK_PREFIX = "Review only. Do not edit files; return findings/analysis only.\n\n";
+
+function withReadOnlyPrefix(task: string | undefined, readOnly: boolean | undefined, authoredTask?: string): string | undefined {
+  if (task === undefined || readOnly !== true) return task;
+  if (authoredTask?.startsWith(READ_ONLY_TASK_PREFIX)) return task;
+  return `${READ_ONLY_TASK_PREFIX}${task}`;
+}
+
+function effectiveReadOnly(workflow: Workflow, step: AgentRunnable, inheritedReadOnly = false): boolean {
+  if (inheritedReadOnly) return true;
+  return (step.readOnly ?? workflow.readOnly) === true;
+}
+
+function toSubagentAgentRunnable(step: AgentRunnable): AgentRunnable {
+  const { readOnly: _readOnly, ...subagentStep } = step;
+  return subagentStep;
+}
+
+function renderAgentRunnable(
+  step: AgentRunnable,
+  rawArgs: string,
+  ctx: ExtensionCommandContext,
+  positional?: string[],
+  workflow?: Workflow,
+  fallbackTask?: string,
+  inheritedReadOnly = false,
+): AgentRunnable {
+  const readOnly = workflow ? effectiveReadOnly(workflow, step, inheritedReadOnly) : step.readOnly === true;
+  const renderedTask = step.task !== undefined ? renderTemplate(step.task, rawArgs, ctx, positional) : fallbackTask;
   return stripUndefined({
     ...step,
-    task: step.task ? renderTemplate(step.task, rawArgs, ctx, positional) : undefined,
+    task: withReadOnlyPrefix(renderedTask, readOnly, step.task),
   });
 }
 
@@ -99,18 +127,41 @@ function renderWorkflowRunnable(step: WorkflowRunnable, rawArgs: string, ctx: Ex
   });
 }
 
-function renderRunnable(step: Runnable, rawArgs: string, ctx: ExtensionCommandContext, positional?: string[]): Runnable {
-  return isWorkflowRunnable(step) ? renderWorkflowRunnable(step, rawArgs, ctx, positional) : renderAgentRunnable(step, rawArgs, ctx, positional);
+function defaultNativeChainTask(rawArgs: string, index: number): string {
+  return index === 0 ? rawArgs : "{previous}";
 }
 
-function renderChainStep(step: ChainStep, rawArgs: string, ctx: ExtensionCommandContext, positional?: string[]): ChainStep {
+function renderRunnable(
+  step: Runnable,
+  rawArgs: string,
+  ctx: ExtensionCommandContext,
+  positional?: string[],
+  workflow?: Workflow,
+  fallbackTask?: string,
+  inheritedReadOnly = false,
+): Runnable {
+  return isWorkflowRunnable(step)
+    ? renderWorkflowRunnable(step, rawArgs, ctx, positional)
+    : renderAgentRunnable(step, rawArgs, ctx, positional, workflow, fallbackTask, inheritedReadOnly);
+}
+
+function renderChainStep(
+  step: ChainStep,
+  rawArgs: string,
+  ctx: ExtensionCommandContext,
+  positional?: string[],
+  workflow?: Workflow,
+  index = 0,
+  inheritedReadOnly = false,
+): ChainStep {
+  const fallbackTask = defaultNativeChainTask(rawArgs, index);
   if (isParallelStep(step)) {
     return stripUndefined({
-      parallel: step.parallel.map((task) => renderRunnable(task, rawArgs, ctx, positional)),
+      parallel: step.parallel.map((task) => renderRunnable(task, rawArgs, ctx, positional, workflow, fallbackTask, inheritedReadOnly)),
       failFast: step.failFast,
     });
   }
-  return renderRunnable(step, rawArgs, ctx, positional);
+  return renderRunnable(step, rawArgs, ctx, positional, workflow, fallbackTask, inheritedReadOnly);
 }
 
 function assertNoNestedWorkflowForSubagentParams(workflow: Workflow): void {
@@ -124,11 +175,11 @@ function toSubagentChainStep(step: ChainStep): SubagentChainStep {
   if (isParallelStep(step)) {
     const parallel = step.parallel.map((entry) => {
       if (isWorkflowRunnable(entry)) throw new Error("Nested workflow runnable cannot be sent directly to pi-subagents.");
-      return entry;
+      return toSubagentAgentRunnable(entry);
     });
     return stripUndefined({ parallel, failFast: step.failFast });
   }
-  return step;
+  return toSubagentAgentRunnable(step);
 }
 
 export function buildSubagentParams(
@@ -136,6 +187,7 @@ export function buildSubagentParams(
   rawArgs: string,
   args: RuntimeArgs = runtimeArgs(rawArgs),
   ctx: ExtensionCommandContext,
+  inheritedReadOnly = false,
 ): SubagentParamsLike {
   assertNoNestedWorkflowForSubagentParams(workflow);
   const positional = args.positional ?? splitArgs(rawArgs);
@@ -145,18 +197,18 @@ export function buildSubagentParams(
 
   if (workflow.chain) {
     params.chain = workflow.chain
-      .map((step) => renderChainStep(step, rawArgs, ctx, positional))
+      .map((step, index) => renderChainStep(step, rawArgs, ctx, positional, workflow, index, inheritedReadOnly))
       .map(toSubagentChainStep);
     params.task = rawArgs;
   } else if (workflow.tasks) {
     params.tasks = workflow.tasks
-      .map((task) => renderAgentRunnable(task, rawArgs, ctx, positional))
-      .map((task) => applyTaskSkillDefault(task, workflow.skill));
+      .map((task) => renderAgentRunnable(task, rawArgs, ctx, positional, workflow, rawArgs, inheritedReadOnly))
+      .map((task) => toSubagentAgentRunnable(applyTaskSkillDefault(task, workflow.skill)));
   } else if (workflow.agent && workflow.task !== undefined) {
     params.agent = workflow.agent;
     params.model = workflow.model;
     params.skill = mergeSkillSpecs(workflow.skill, undefined);
-    params.task = renderTemplate(workflow.task, rawArgs, ctx, positional);
+    params.task = withReadOnlyPrefix(renderTemplate(workflow.task, rawArgs, ctx, positional), inheritedReadOnly || workflow.readOnly === true, workflow.task);
   }
 
   return stripUndefined(params);
@@ -229,6 +281,7 @@ type WorkflowRunResult = {
 
 type ExecutionOptions = {
   stack: string[];
+  inheritedReadOnly?: boolean;
   onProgress?: (requestId: string, update: SlashSubagentUpdate) => void;
 };
 
@@ -266,7 +319,7 @@ async function executeSimpleWorkflowForResult(
   rawArgs: string,
   options: ExecutionOptions,
 ): Promise<WorkflowRunResult> {
-  const params = buildSubagentParams(workflow, rawArgs, runtimeArgs(rawArgs), ctx);
+  const params = buildSubagentParams(workflow, rawArgs, runtimeArgs(rawArgs), ctx, options.inheritedReadOnly === true);
   const requestId = randomUUID();
   const response = await requestSubagentRun(pi, ctx, requestId, params, workflow.name, {
     onUpdate: options.onProgress,
@@ -348,7 +401,11 @@ async function executeAgentRunnableForResult(
   const effectiveStep = applyTaskSkillDefault(step, parentWorkflow.skill);
   const params: SubagentParamsLike = stripUndefined({
     agent: effectiveStep.agent,
-    task: renderRunnableTask(effectiveStep, rawArgs, ctx, positional, previous, index),
+    task: withReadOnlyPrefix(
+      renderRunnableTask(effectiveStep, rawArgs, ctx, positional, previous, index),
+      effectiveReadOnly(parentWorkflow, step, options.inheritedReadOnly === true),
+      effectiveStep.task,
+    ),
     model: effectiveStep.model,
     skill: effectiveStep.skill,
   });
@@ -402,7 +459,10 @@ async function executeWorkflowRunnableForResult(
   const positional = splitArgs(rawArgs);
   const childArgs = renderCompositeTemplate(step.args ?? "{{args}}", rawArgs, ctx, positional, previous, rawArgs);
   const child = lookupWorkflow(ctx.cwd, step.workflow);
-  return executeWorkflowForResult(pi, ctx, child, childArgs, options);
+  return executeWorkflowForResult(pi, ctx, child, childArgs, {
+    ...options,
+    inheritedReadOnly: options.inheritedReadOnly === true || parentWorkflow.readOnly === true,
+  });
 }
 
 async function executeRunnableForResult(

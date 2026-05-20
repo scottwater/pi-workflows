@@ -54,6 +54,7 @@ Minimal multi-agent review workflow:
 {
   "name": "review-agents",
   "description": "Multi-agent code review",
+  "readOnly": true,
   "chain": [
     {
       "parallel": [
@@ -82,6 +83,7 @@ Supported top-level fields:
 - `description` — optional text shown in command help and `/workflow --list`.
 - `defaultAgent` — optional default agent for agent runnables that omit `agent`.
 - `skill` / `skills` — optional workflow-level skill injection/default.
+- `readOnly` — optional boolean. When `true`, agent tasks in this workflow and nested child workflows are prefixed with an explicit review-only/no-edit instruction before delegation. Use this for audit/review/report workflows whose child output may include words like “fix”, “add tests”, or “update code”; it prevents pi-subagents' completion guard from treating synthesis/report tasks as failed implementation tasks.
 - Exactly one execution shape:
   - `agent` + `task` — single-agent workflow.
   - `tasks` — top-level parallel agent tasks.
@@ -93,6 +95,7 @@ Agent runnable fields:
 - `task` — task template.
 - `model` — optional explicit model override. If omitted, the agent's own configured model is used.
 - `skill` / `skills` — optional per-runnable skill override/addition. `skill: false` disables a workflow-level skill default for that runnable.
+- `readOnly` — optional per-runnable override. Set `false` to opt an agent runnable out of its own workflow's `readOnly: true` default. Inherited read-only policy from a parent workflow cannot be weakened by child workflow settings.
 
 Workflow runnable fields:
 
@@ -115,6 +118,7 @@ A workflow can execute other workflows alongside normal agents:
 ```jsonc
 {
   "name": "quality-sweep",
+  "readOnly": true,
   "chain": [
     {
       "parallel": [
@@ -136,7 +140,7 @@ A workflow can execute other workflows alongside normal agents:
 }
 ```
 
-Nested workflow execution is deliberately simple: child workflows receive rendered `args` and otherwise use the same default `pi-subagents` behavior as any other workflow.
+Nested workflow execution is deliberately simple: child workflows receive rendered `args` and otherwise use the same default `pi-subagents` behavior as any other workflow. If a parent workflow is `readOnly: true`, that policy is inherited by nested workflows and cannot be weakened by the child workflow or child agent runnable settings.
 
 ## Template variables
 

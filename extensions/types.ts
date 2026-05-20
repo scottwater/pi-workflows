@@ -7,6 +7,7 @@ export type AgentRunnable = {
   task?: string;
   model?: string;
   skill?: SkillSpec;
+  readOnly?: boolean;
 };
 
 export type WorkflowRunnable = {
@@ -28,6 +29,7 @@ export type Workflow = {
   description?: string;
   defaultAgent?: string;
   skill?: SkillSpec;
+  readOnly?: boolean;
   chain?: ChainStep[];
   tasks?: AgentRunnable[];
   agent?: string;

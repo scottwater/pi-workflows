@@ -1,6 +1,7 @@
 {
   "name": "review-deep",
   "description": "Deep multi-agent code review with comments and type-design analysis",
+  "readOnly": true,
   "chain": [
     {
       "parallel": [

@@ -182,9 +182,9 @@ function stepAgent(value: Record<string, unknown>, fieldPath: string, defaultAge
 }
 
 const WORKFLOW_KEYS = [
-  "name", "description", "defaultAgent", "skill", "skills", "chain", "tasks", "agent", "task", "model",
+  "name", "description", "defaultAgent", "skill", "skills", "readOnly", "chain", "tasks", "agent", "task", "model",
 ] as const;
-const AGENT_RUNNABLE_KEYS = ["agent", "task", "model", "skill", "skills"] as const;
+const AGENT_RUNNABLE_KEYS = ["agent", "task", "model", "skill", "skills", "readOnly"] as const;
 const WORKFLOW_RUNNABLE_KEYS = ["workflow", "args"] as const;
 const PARALLEL_STEP_KEYS = ["parallel", "failFast"] as const;
 
@@ -203,6 +203,7 @@ function validateAgentRunnable(value: unknown, fieldPath: string, defaultAgent?:
     task: assertOptionalString(value.task, `${fieldPath}.task`),
     model: assertOptionalString(value.model, `${fieldPath}.model`),
     skill: normalizeSkillAlias(value, fieldPath),
+    readOnly: assertOptionalBoolean(value.readOnly, `${fieldPath}.readOnly`),
   });
 }
 
@@ -281,6 +282,7 @@ export function parseWorkflowFile(path: string): Workflow | undefined {
     description: assertOptionalString(parsed.description, `${workflowPath}.description`),
     defaultAgent,
     skill: normalizeSkillAlias(parsed, workflowPath),
+    readOnly: assertOptionalBoolean(parsed.readOnly, `${workflowPath}.readOnly`),
     chain,
     tasks,
     agent,
